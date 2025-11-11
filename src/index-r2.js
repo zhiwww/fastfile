@@ -5,7 +5,7 @@
  */
 
 import { AwsClient } from 'aws4fetch';
-import { zipSync } from 'fflate';
+import { Zip, ZipPassThrough, strToU8 } from 'fflate';
 import {
   generateFileId,
   isValidPassword,
@@ -31,11 +31,12 @@ const compressionProgress = new Map();
 // 统一配置 - 前后端共享
 // =============================================
 const CONFIG = {
-  CHUNK_SIZE: 10 * 1024 * 1024, // 10MB - R2 multipart 要求每个 part 至少 5MB（除最后一个）
-  MAX_CONCURRENT: 4, // 最大并发上传数
+  CHUNK_SIZE: 5 * 1024 * 1024, // 10MB - R2 multipart 要求每个 part 至少 5MB（除最后一个）
+  MAX_CONCURRENT: 6, // 最大并发上传数
   MAX_RETRY_ATTEMPTS: 5, // 最大重试次数
   RETRY_DELAY_BASE: 1000, // 基础重试延迟(ms)
 };
+
 
 // R2 multipart upload 限制
 const R2_LIMITS = {
@@ -739,9 +740,8 @@ async function handleUploadStatus(uploadId, env) {
 
 /**
  * 执行实际的压缩操作
- * 🔧 智能环境检测：
- * - 生产环境：优先使用 R2 binding (env.FILE_STORAGE) - 更快，无API调用
- * - 本地开发：自动回退到 S3 API - 因为本地binding指向本地R2，但文件在云端R2
+ * 🔧 使用流式压缩避免内存溢出
+ * 🔧 智能环境检测：生产环境用 R2 binding，本地开发用 S3 API
  */
 async function performCompression(uploadId, uploadMeta, env) {
   console.log(`🔄 [Compression] Starting compression for uploadId: ${uploadId}`);
@@ -751,171 +751,465 @@ async function performCompression(uploadId, uploadMeta, env) {
     await env.FILE_META.put(`upload:${uploadId}`, JSON.stringify(uploadMeta));
     console.log(`✅ [Compression] Status updated to 'compressing'`);
 
-    // 准备压缩数据
-    const filesToZip = {};
-    let processedCount = 0;
+    // 🎯 单个 ZIP 文件优化：直接存储不压缩
+    // 其他情况（单个非 zip 文件、多个文件）都需要压缩
+    const isSingleZipFile = uploadMeta.files.length === 1 &&
+      uploadMeta.files[0].name.toLowerCase().endsWith('.zip');
 
-    // 🔧 智能环境检测：先尝试R2 binding，失败则使用S3 API
-    let useS3API = false;
-    const awsClient = getAwsClient(env);
-    const r2Url = getR2Url(env);
-
-    // 从R2读取所有已上传的文件
-    console.log(`📂 [Compression] Reading ${uploadMeta.files.length} files from R2...`);
-    for (const fileInfo of uploadMeta.files) {
-      console.log(`🔍 [Compression] Fetching file: ${fileInfo.key}`);
-
-      let fileData;
-
-      // 首先尝试使用 R2 binding（生产环境）
-      if (!useS3API) {
-        try {
-          const r2Object = await env.FILE_STORAGE.get(fileInfo.key);
-          if (r2Object) {
-            fileData = await r2Object.arrayBuffer();
-            console.log(`✅ [Compression] File read via R2 binding: ${fileInfo.name}, size: ${fileData.byteLength} bytes`);
-          } else {
-            // 文件不存在于binding，切换到S3 API
-            console.log(`⚠️ [Compression] File not found in R2 binding, switching to S3 API`);
-            useS3API = true;
-          }
-        } catch (bindingError) {
-          console.log(`⚠️ [Compression] R2 binding error, switching to S3 API: ${bindingError.message}`);
-          useS3API = true;
-        }
-      }
-
-      // 如果 binding 失败，使用 S3 API（本地开发）
-      if (useS3API || !fileData) {
-        const response = await awsClient.fetch(`${r2Url}/${fileInfo.key}`);
-        if (!response.ok) {
-          throw new Error(`文件不存在: ${fileInfo.name} (HTTP ${response.status})`);
-        }
-        fileData = await response.arrayBuffer();
-        console.log(`✅ [Compression] File read via S3 API: ${fileInfo.name}, size: ${fileData.byteLength} bytes`);
-      }
-
-      filesToZip[fileInfo.name] = new Uint8Array(fileData);
-
-      processedCount++;
-
-      // 更新进度
-      const progress = Math.round((processedCount / uploadMeta.files.length) * 50); // 0-50% for reading
-      compressionProgress.set(uploadId, {
-        status: 'reading',
-        progress,
-        currentFile: fileInfo.name,
-        processedCount,
-        totalCount: uploadMeta.files.length,
-      });
-      console.log(`📊 [Compression] Progress: ${progress}% (${processedCount}/${uploadMeta.files.length} files read)`);
+    if (isSingleZipFile) {
+      console.log(`📦 [Compression] Single ZIP file detected, skipping compression`);
+      return await handleSingleFile(uploadId, uploadMeta, env);
     }
 
-    console.log(`ℹ️ [Compression] Environment: ${useS3API ? 'Local Dev (S3 API)' : 'Production (R2 Binding)'}`);
-
-
-    // 更新进度：开始压缩
-    compressionProgress.set(uploadId, {
-      status: 'compressing',
-      progress: 50,
-      message: '开始压缩文件...',
-    });
-    console.log(`🗜️ [Compression] Starting ZIP compression...`);
-
-    // 使用fflate进行同步压缩
-    const zipped = zipSync(filesToZip, {
-      level: 3, // 压缩级别 0-9，使用3提供快速压缩和适中的压缩率
-    });
-    console.log(`✅ [Compression] ZIP compression completed, size: ${zipped.byteLength} bytes`);
-
-    // 更新进度：压缩完成，保存文件
-    compressionProgress.set(uploadId, {
-      status: 'saving',
-      progress: 90,
-      message: '正在保存压缩文件...',
-    });
-    console.log(`💾 [Compression] Saving compressed file to R2...`);
-
-    // 生成最终文件ID
-    const fileId = generateFileId();
-    const expiryTime = getExpiryTime();
-
-    // 存储压缩后的文件到R2
-    await env.FILE_STORAGE.put(fileId, zipped);
-    console.log(`✅ [Compression] File saved to R2 with ID: ${fileId}`);
-
-    // 保存最终元数据
-    const metadata = {
-      fileId,
-      password: uploadMeta.password,
-      expiryTime,
-      createdAt: Date.now(),
-      fileName: 'files.zip',
-      fileSize: zipped.byteLength,
-      originalFileCount: uploadMeta.files.length,
-      originalTotalSize: uploadMeta.totalSize,
-    };
-
-    await env.FILE_META.put(fileId, JSON.stringify(metadata));
-    console.log(`✅ [Compression] Metadata saved`);
-
-    // 删除临时文件（使用智能环境检测）
-    console.log(`🗑️ [Compression] Deleting ${uploadMeta.files.length} temporary files...`);
-    for (const fileInfo of uploadMeta.files) {
-      try {
-        if (useS3API) {
-          // 本地开发：使用 S3 API 删除
-          const deleteResponse = await awsClient.fetch(`${r2Url}/${fileInfo.key}`, {
-            method: 'DELETE'
-          });
-          console.log(`✅ [Compression] Deleted temp file via S3 API: ${fileInfo.key} (status: ${deleteResponse.status})`);
-        } else {
-          // 生产环境：使用 R2 binding 删除
-          await env.FILE_STORAGE.delete(fileInfo.key);
-          console.log(`✅ [Compression] Deleted temp file via R2 binding: ${fileInfo.key}`);
-        }
-      } catch (deleteError) {
-        console.warn(`⚠️ [Compression] Failed to delete temp file: ${fileInfo.key}`, deleteError);
-        // 继续删除其他文件，不要因为一个文件失败而中断
-      }
+    // 其他情况：使用流式压缩
+    if (uploadMeta.files.length === 1) {
+      console.log(`📄 [Compression] Single non-ZIP file detected, compressing...`);
+    } else {
+      console.log(`📁 [Compression] Multiple files detected, compressing...`);
     }
-
-    // 更新上传元数据为已完成
-    uploadMeta.status = 'completed';
-    uploadMeta.fileId = fileId;
-    uploadMeta.compressedAt = Date.now();
-    uploadMeta.compressedSize = zipped.byteLength;
-    await env.FILE_META.put(`upload:${uploadId}`, JSON.stringify(uploadMeta));
-    console.log(`✅ [Compression] Upload metadata updated to 'completed'`);
-
-    // 更新最终进度
-    compressionProgress.set(uploadId, {
-      status: 'completed',
-      progress: 100,
-      fileId,
-      downloadUrl: `/d/${fileId}`,
-    });
-    console.log(`🎉 [Compression] Compression completed successfully!`);
-
-    // 5分钟后清理进度数据
-    setTimeout(() => {
-      compressionProgress.delete(uploadId);
-      console.log(`🧹 [Compression] Progress data cleaned for uploadId: ${uploadId}`);
-    }, 5 * 60 * 1000);
+    return await handleMultipleFiles(uploadId, uploadMeta, env);
 
   } catch (error) {
-    console.error(`❌ [Compression] ERROR for uploadId ${uploadId}:`, error);
-    console.error(`❌ [Compression] Error stack:`, error.stack);
-
-    // 更新状态为失败
+    console.error(`❌ [Compression] Error:`, error);
     uploadMeta.status = 'failed';
     uploadMeta.error = error.message;
     await env.FILE_META.put(`upload:${uploadId}`, JSON.stringify(uploadMeta));
+    compressionProgress.delete(uploadId);
+    throw error;
+  }
+}
+
+/**
+ * 处理单文件上传（直接存储不压缩）
+ */
+async function handleSingleFile(uploadId, uploadMeta, env) {
+  const fileInfo = uploadMeta.files[0];
+  console.log(`📂 [SingleFile] Processing: ${fileInfo.name}`);
+
+  let useS3API = false;
+  const awsClient = getAwsClient(env);
+  const r2Url = getR2Url(env);
+
+  // 读取文件
+  let fileData;
+  try {
+    const r2Object = await env.FILE_STORAGE.get(fileInfo.key);
+    if (r2Object) {
+      fileData = await r2Object.arrayBuffer();
+      console.log(`✅ [SingleFile] Read via R2 binding: ${fileData.byteLength} bytes`);
+    } else {
+      useS3API = true;
+    }
+  } catch (error) {
+    console.log(`⚠️ [SingleFile] R2 binding failed, using S3 API`);
+    useS3API = true;
+  }
+
+  if (useS3API || !fileData) {
+    const response = await awsClient.fetch(`${r2Url}/${fileInfo.key}`);
+    if (!response.ok) {
+      throw new Error(`文件不存在: ${fileInfo.name}`);
+    }
+    fileData = await response.arrayBuffer();
+    console.log(`✅ [SingleFile] Read via S3 API: ${fileData.byteLength} bytes`);
+  }
+
+  // 生成文件ID并存储
+  const fileId = generateFileId();
+  const expiryTime = getExpiryTime();
+
+  await env.FILE_STORAGE.put(fileId, fileData);
+  console.log(`✅ [SingleFile] Saved with ID: ${fileId}`);
+
+  // 保存元数据
+  const metadata = {
+    fileId,
+    fileName: fileInfo.name,
+    password: uploadMeta.password,
+    expiryTime,
+    uploadedAt: Date.now(),
+    fileCount: 1,
+    fileSize: fileData.byteLength,
+  };
+
+  await env.FILE_META.put(fileId, JSON.stringify(metadata));
+
+  // 更新上传状态
+  uploadMeta.status = 'completed';
+  uploadMeta.fileId = fileId;
+  await env.FILE_META.put(`upload:${uploadId}`, JSON.stringify(uploadMeta));
+
+  // 删除临时文件
+  await env.FILE_STORAGE.delete(fileInfo.key);
+
+  compressionProgress.delete(uploadId);
+  console.log(`🎉 [SingleFile] Completed: ${fileId}`);
+
+  return fileId;
+}
+
+/**
+ * 处理多文件：GB级别流式压缩
+ * - 分块读取：每次读取10MB避免内存溢出
+ * - 流式压缩：使用 fflate Zip 流式 API
+ * - 分块写入：使用 R2 Multipart Upload 边生成边上传
+ */
+async function handleMultipleFiles(uploadId, uploadMeta, env) {
+  console.log(`🗜️ [MultiFile] Starting GB-scale streaming compression for ${uploadMeta.files.length} files`);
+
+  const CHUNK_READ_SIZE = 10 * 1024 * 1024; // 10MB 分块读取
+  const awsClient = getAwsClient(env);
+  const r2Url = getR2Url(env);
+
+  // 🎯 准备 R2 Multipart Upload 用于写入最终 ZIP
+  const fileId = generateFileId();
+  const expiryTime = getExpiryTime();
+
+  console.log(`🚀 [MultiFile] Initializing R2 Multipart Upload for final ZIP: ${fileId}`);
+  const uploadIdForZip = await initMultipartUpload(fileId, awsClient, r2Url);
+
+  const uploadedParts = [];
+  let currentChunkBuffer = [];
+  let currentChunkSize = 0;
+  let partNumber = 1;
+  const MIN_PART_SIZE = 5 * 1024 * 1024; // R2 最小分块 5MB
+
+  // 🎯 创建流式 ZIP 生成器（边生成边上传到 R2）
+  let zipError = null;
+  let zipFinalized = false;
+  let pendingUploads = [];  // 🔧 收集所有待处理的上传 Promise
+
+  const zipStream = new Zip((err, chunk, final) => {
+    if (err) {
+      console.error(`❌ [MultiFile] ZIP stream error:`, err);
+      zipError = err;
+      return;
+    }
+
+    if (chunk && chunk.byteLength > 0) {
+      console.log(`📦 [MultiFile] ZIP chunk generated: ${chunk.byteLength} bytes`);
+
+      // 累积 chunk 到缓冲区
+      currentChunkBuffer.push(chunk);
+      currentChunkSize += chunk.byteLength;
+
+      // 当缓冲区 >= 5MB 时，上传一个 part
+      if (currentChunkSize >= MIN_PART_SIZE) {
+        const partData = mergeUint8Arrays(currentChunkBuffer);
+        const currentPartNumber = partNumber++;  // 先递增，避免竞态条件
+        console.log(`⬆️ [MultiFile] Uploading part ${currentPartNumber}: ${partData.byteLength} bytes`);
+
+        // 🔧 创建上传 Promise 并收集起来
+        const uploadPromise = (async () => {
+          try {
+            const etag = await uploadPart(fileId, uploadIdForZip, currentPartNumber, partData, awsClient, r2Url);
+            uploadedParts.push({ PartNumber: currentPartNumber, ETag: etag, Size: partData.byteLength });
+          } catch (error) {
+            console.error(`❌ [MultiFile] Failed to upload part ${currentPartNumber}:`, error);
+            zipError = error;
+          }
+        })();
+        pendingUploads.push(uploadPromise);
+
+        currentChunkBuffer = [];
+        currentChunkSize = 0;
+      }
+    }
+
+    if (final) {
+      console.log(`✅ [MultiFile] ZIP stream finalized`);
+
+      // 上传最后的缓冲区（如果有）
+      if (currentChunkSize > 0) {
+        const partData = mergeUint8Arrays(currentChunkBuffer);
+        const currentPartNumber = partNumber++;  // 先递增，避免竞态条件
+        console.log(`⬆️ [MultiFile] Uploading final part ${currentPartNumber}: ${partData.byteLength} bytes`);
+
+        // 🔧 创建上传 Promise 并收集起来
+        const uploadPromise = (async () => {
+          try {
+            const etag = await uploadPart(fileId, uploadIdForZip, currentPartNumber, partData, awsClient, r2Url);
+            uploadedParts.push({ PartNumber: currentPartNumber, ETag: etag, Size: partData.byteLength });
+          } catch (error) {
+            console.error(`❌ [MultiFile] Failed to upload final part ${currentPartNumber}:`, error);
+            zipError = error;
+          }
+        })();
+        pendingUploads.push(uploadPromise);
+      }
+
+      // 🔧 等待所有上传完成后再设置 zipFinalized = true
+      Promise.all(pendingUploads)
+        .then(() => {
+          console.log(`✅ [MultiFile] All ${pendingUploads.length} parts uploaded successfully`);
+          zipFinalized = true;
+        })
+        .catch((error) => {
+          console.error(`❌ [MultiFile] Failed to upload parts:`, error);
+          zipError = error;
+          zipFinalized = true;  // 即使失败也要设置，以便外层检测到错误
+        });
+    }
+  });
+
+  // 🔄 逐个文件分块读取并流式压缩
+  let processedCount = 0;
+
+  for (const fileInfo of uploadMeta.files) {
+    console.log(`🔍 [MultiFile] Processing file ${processedCount + 1}/${uploadMeta.files.length}: ${fileInfo.name}`);
 
     compressionProgress.set(uploadId, {
-      status: 'failed',
-      error: error.message,
+      status: 'reading',
+      progress: Math.round((processedCount / uploadMeta.files.length) * 80),
+      currentFile: fileInfo.name,
+      processedCount,
+      totalCount: uploadMeta.files.length,
     });
+
+    // 🗜️ 创建文件流（不压缩，level=0）
+    const fileStream = new ZipPassThrough(fileInfo.name);
+    zipStream.add(fileStream);
+
+    // 📖 获取文件大小
+    let fileSize;
+    try {
+      const headResponse = await awsClient.fetch(`${r2Url}/${fileInfo.key}`, { method: 'HEAD' });
+      fileSize = parseInt(headResponse.headers.get('content-length') || '0');
+      console.log(`📏 [MultiFile] File size: ${fileSize} bytes`);
+    } catch (error) {
+      console.warn(`⚠️ [MultiFile] Failed to get file size, will read in one go`);
+      fileSize = null;
+    }
+
+    // 🔄 分块读取文件并推送到压缩流
+    if (fileSize && fileSize > CHUNK_READ_SIZE) {
+      // 大文件：分块读取
+      let offset = 0;
+      while (offset < fileSize) {
+        const end = Math.min(offset + CHUNK_READ_SIZE - 1, fileSize - 1);
+        console.log(`📖 [MultiFile] Reading chunk: bytes ${offset}-${end}`);
+
+        const response = await awsClient.fetch(`${r2Url}/${fileInfo.key}`, {
+          headers: { Range: `bytes=${offset}-${end}` },
+        });
+
+        if (!response.ok) {
+          throw new Error(`Failed to read file chunk: ${response.status}`);
+        }
+
+        const chunkData = new Uint8Array(await response.arrayBuffer());
+        const isFinal = (end >= fileSize - 1);
+
+        fileStream.push(chunkData, isFinal);
+        console.log(`✅ [MultiFile] Pushed ${chunkData.byteLength} bytes to ZIP stream (final: ${isFinal})`);
+
+        offset = end + 1;
+      }
+    } else {
+      // 小文件：一次读取
+      const response = await awsClient.fetch(`${r2Url}/${fileInfo.key}`);
+      if (!response.ok) {
+        throw new Error(`文件不存在: ${fileInfo.name}`);
+      }
+
+      const fileData = new Uint8Array(await response.arrayBuffer());
+      fileStream.push(fileData, true);
+      console.log(`✅ [MultiFile] Pushed entire file (${fileData.byteLength} bytes) to ZIP stream`);
+    }
+
+    // 🗑️ 立即删除临时文件
+    try {
+      await env.FILE_STORAGE.delete(fileInfo.key);
+      console.log(`🗑️ [MultiFile] Deleted temp file: ${fileInfo.key}`);
+    } catch (error) {
+      console.warn(`⚠️ [MultiFile] Failed to delete temp file: ${fileInfo.key}`);
+    }
+
+    processedCount++;
+
+    if (zipError) {
+      throw new Error(`ZIP stream error: ${zipError.message}`);
+    }
+  }
+
+  console.log(`ℹ️ [MultiFile] All ${uploadMeta.files.length} files added to ZIP stream`);
+
+  // 🏁 结束 ZIP 流
+  zipStream.end();
+  console.log(`🏁 [MultiFile] ZIP stream ended, waiting for finalization...`);
+
+  // ⏳ 等待 ZIP 流完成
+  const maxWait = 60000; // 60秒超时
+  const startTime = Date.now();
+  while (!zipFinalized && !zipError && (Date.now() - startTime) < maxWait) {
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+
+  if (zipError) {
+    await abortMultipartUpload(fileId, uploadIdForZip, awsClient, r2Url);
+    throw new Error(`压缩失败: ${zipError.message || zipError}`);
+  }
+
+  if (!zipFinalized) {
+    await abortMultipartUpload(fileId, uploadIdForZip, awsClient, r2Url);
+    throw new Error('压缩超时');
+  }
+
+  // ✅ 完成 R2 Multipart Upload
+  compressionProgress.set(uploadId, {
+    status: 'finalizing',
+    progress: 90,
+    message: '正在完成上传...',
+  });
+
+  console.log(`🏁 [MultiFile] Completing R2 Multipart Upload with ${uploadedParts.length} parts`);
+  await completeMultipartUpload(fileId, uploadIdForZip, uploadedParts, awsClient, r2Url);
+  console.log(`✅ [MultiFile] R2 Multipart Upload completed: ${fileId}`);
+
+  // 💾 保存元数据
+  const totalSize = uploadedParts.reduce((sum, part) => sum + part.Size || 0, 0);
+  const metadata = {
+    fileId,
+    fileName: 'files.zip',
+    password: uploadMeta.password,
+    expiryTime,
+    uploadedAt: Date.now(),
+    fileCount: uploadMeta.files.length,
+    fileSize: totalSize,
+  };
+
+  await env.FILE_META.put(fileId, JSON.stringify(metadata));
+
+  // ✅ 更新上传状态
+  uploadMeta.status = 'completed';
+  uploadMeta.fileId = fileId;
+  await env.FILE_META.put(`upload:${uploadId}`, JSON.stringify(uploadMeta));
+
+  compressionProgress.delete(uploadId);
+  console.log(`🎉 [MultiFile] Completed: ${fileId}`);
+
+  return fileId;
+}
+
+/**
+ * 合并多个 Uint8Array
+ */
+function mergeUint8Arrays(arrays) {
+  const totalLength = arrays.reduce((sum, arr) => sum + arr.byteLength, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const arr of arrays) {
+    result.set(arr, offset);
+    offset += arr.byteLength;
+  }
+  return result;
+}
+
+/**
+ * 初始化 R2 Multipart Upload
+ */
+async function initMultipartUpload(key, awsClient, r2Url) {
+  const url = `${r2Url}/${key}?uploads`;
+
+  const response = await awsClient.fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/octet-stream',
+    },
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Failed to init multipart upload: ${response.status} ${error}`);
+  }
+
+  const xmlText = await response.text();
+  const uploadIdMatch = xmlText.match(/<UploadId>([^<]+)<\/UploadId>/);
+
+  if (!uploadIdMatch) {
+    throw new Error('Failed to extract UploadId from response');
+  }
+
+  const uploadId = uploadIdMatch[1];
+  console.log(`🚀 [Multipart] Initialized upload: ${uploadId}`);
+
+  return uploadId;
+}
+
+/**
+ * 上传单个 part
+ */
+async function uploadPart(key, uploadId, partNumber, data, awsClient, r2Url) {
+  const url = `${r2Url}/${key}?partNumber=${partNumber}&uploadId=${encodeURIComponent(uploadId)}`;
+
+  const response = await awsClient.fetch(url, {
+    method: 'PUT',
+    body: data,
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': data.byteLength.toString(),
+    },
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Failed to upload part ${partNumber}: ${response.status} ${error}`);
+  }
+
+  const etag = response.headers.get('etag');
+  if (!etag) {
+    throw new Error(`No ETag returned for part ${partNumber}`);
+  }
+
+  console.log(`✅ [Multipart] Uploaded part ${partNumber}: ${etag}`);
+  return etag;
+}
+
+/**
+ * 完成 R2 Multipart Upload
+ */
+async function completeMultipartUpload(key, uploadId, parts, awsClient, r2Url) {
+  const url = `${r2Url}/${key}?uploadId=${encodeURIComponent(uploadId)}`;
+
+  // 构造 XML body
+  const xmlParts = parts.map(part =>
+    `<Part><PartNumber>${part.PartNumber}</PartNumber><ETag>${part.ETag}</ETag></Part>`
+  ).join('');
+
+  const xmlBody = `<CompleteMultipartUpload>${xmlParts}</CompleteMultipartUpload>`;
+
+  const response = await awsClient.fetch(url, {
+    method: 'POST',
+    body: xmlBody,
+    headers: {
+      'Content-Type': 'application/xml',
+    },
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Failed to complete multipart upload: ${response.status} ${error}`);
+  }
+
+  console.log(`🎉 [Multipart] Completed upload: ${key}`);
+  return await response.text();
+}
+
+/**
+ * 中止 R2 Multipart Upload
+ */
+async function abortMultipartUpload(key, uploadId, awsClient, r2Url) {
+  const url = `${r2Url}/${key}?uploadId=${encodeURIComponent(uploadId)}`;
+
+  const response = await awsClient.fetch(url, {
+    method: 'DELETE',
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    console.error(`⚠️ [Multipart] Failed to abort upload: ${response.status} ${error}`);
+  } else {
+    console.log(`🗑️ [Multipart] Aborted upload: ${uploadId}`);
   }
 }
 
@@ -1003,22 +1297,63 @@ async function handleDownload(fileId, request, env) {
       return errorResponse('无效的下载令牌', 401);
     }
 
-    // 从R2获取文件
-    const object = await env.FILE_STORAGE.get(fileId);
+    // 🔧 从R2获取文件（智能选择访问方式）
+    // 策略：优先使用原生 R2 Binding（生产环境），如果失败则使用 aws4fetch（本地开发环境）
 
-    if (!object) {
-      return errorResponse('文件数据不存在', 404);
+    console.log(`📥 [Download] Attempting to fetch file: ${fileId}`);
+
+    // 方案1：尝试使用原生 R2 Binding（生产环境最优）
+    try {
+      const object = await env.FILE_STORAGE.get(fileId);
+
+      if (object) {
+        console.log(`✅ [Download] File fetched via R2 Binding (production mode)`);
+        return new Response(object.body, {
+          headers: {
+            'Content-Type': 'application/zip',
+            'Content-Disposition': `attachment; filename="${encodeURIComponent(metadata.fileName)}"`,
+            'Content-Length': metadata.fileSize.toString(),
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      }
+
+      console.log(`⚠️ [Download] R2 Binding returned null, trying aws4fetch...`);
+    } catch (error) {
+      console.log(`⚠️ [Download] R2 Binding failed: ${error.message}, trying aws4fetch...`);
     }
 
-    // 返回文件
-    return new Response(object.body, {
-      headers: {
-        'Content-Type': 'application/zip',
-        'Content-Disposition': `attachment; filename="${encodeURIComponent(metadata.fileName)}"`,
-        'Content-Length': metadata.fileSize.toString(),
-        'Access-Control-Allow-Origin': '*',
-      },
-    });
+    // 方案2：使用 aws4fetch 访问远程 R2（本地开发环境 fallback）
+    try {
+      const awsClient = getAwsClient(env);
+      const r2Url = getR2Url(env);
+      const downloadUrl = `${r2Url}/${fileId}`;
+
+      console.log(`🔄 [Download] Fetching via aws4fetch (dev mode): ${downloadUrl}`);
+
+      const response = await awsClient.fetch(downloadUrl, {
+        method: 'GET',
+      });
+
+      if (response.ok) {
+        console.log(`✅ [Download] File fetched via aws4fetch`);
+        return new Response(response.body, {
+          headers: {
+            'Content-Type': 'application/zip',
+            'Content-Disposition': `attachment; filename="${encodeURIComponent(metadata.fileName)}"`,
+            'Content-Length': metadata.fileSize.toString(),
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      }
+
+      console.error(`❌ [Download] aws4fetch failed: ${response.status} ${response.statusText}`);
+    } catch (error) {
+      console.error(`❌ [Download] aws4fetch error: ${error.message}`);
+    }
+
+    // 两种方式都失败了
+    return errorResponse('文件数据不存在', 404);
 
   } catch (error) {
     console.error('Download error:', error);
@@ -1435,12 +1770,48 @@ async function serveUploadPage() {
     }
 
     .password-value {
-      font-size: 24px;
+      font-size: 32px;
       font-weight: bold;
       color: #d63384;
       font-family: 'Monaco', 'Courier New', monospace;
-      margin: 5px 0;
-      letter-spacing: 2px;
+      margin: 10px 0;
+      letter-spacing: 4px;
+      background: linear-gradient(135deg, #ffeaa7 0%, #fdcb6e 100%);
+      padding: 15px 25px;
+      border-radius: 10px;
+      box-shadow: 0 4px 15px rgba(214, 51, 132, 0.2);
+      cursor: pointer;
+      transition: all 0.3s ease;
+      display: inline-block;
+      user-select: none;
+      position: relative;
+    }
+
+    .password-value:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(214, 51, 132, 0.3);
+      background: linear-gradient(135deg, #fdcb6e 0%, #ffeaa7 100%);
+    }
+
+    .password-value:active {
+      transform: translateY(0);
+    }
+
+    .password-value::after {
+      content: '点击复制';
+      position: absolute;
+      bottom: -20px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 11px;
+      color: #856404;
+      opacity: 0;
+      transition: opacity 0.3s ease;
+      white-space: nowrap;
+    }
+
+    .password-value:hover::after {
+      opacity: 1;
     }
 
     .btn-next-upload {
@@ -1845,8 +2216,10 @@ async function serveUploadPage() {
       showResult(\`
         <div class="password-reminder">
           <div>⚠️ 下载时需要输入下面的密码</div>
-          <div class="password-value">\${currentPassword}</div>
-          <div style="font-size: 12px; color: #856404; margin-top: 5px;">请妥善保管此密码</div>
+          <div class="password-value" onclick="copyToClipboard('\${currentPassword}', this)" title="点击复制密码">
+            \${currentPassword}
+          </div>
+          <div style="font-size: 12px; color: #856404; margin-top: 25px;">点击复制此密码</div>
         </div>
         <div class="url-container">
           <div class="url-row">
@@ -1863,17 +2236,32 @@ async function serveUploadPage() {
     }
 
     // 复制到剪贴板
-    window.copyToClipboard = async function(text, button) {
+    window.copyToClipboard = async function(text, element) {
       try {
         await navigator.clipboard.writeText(text);
-        const originalText = button.textContent;
-        button.textContent = '✓ 已复制';
-        button.classList.add('copied');
+        const originalText = element.textContent;
+        const isPasswordDiv = element.classList.contains('password-value');
 
-        setTimeout(() => {
-          button.textContent = originalText;
-          button.classList.remove('copied');
-        }, 2000);
+        if (isPasswordDiv) {
+          // 对于密码 div，显示临时提示而不改变密码显示
+          const originalContent = element.innerHTML;
+          element.innerHTML = '✓ 已复制！';
+          element.style.background = 'linear-gradient(135deg, #a8e6cf 0%, #56cc9d 100%)';
+
+          setTimeout(() => {
+            element.innerHTML = originalContent;
+            element.style.background = '';
+          }, 1500);
+        } else {
+          // 对于按钮，改变文本
+          element.textContent = '✓ 已复制';
+          element.classList.add('copied');
+
+          setTimeout(() => {
+            element.textContent = originalText;
+            element.classList.remove('copied');
+          }, 2000);
+        }
       } catch (err) {
         console.error('复制失败:', err);
         // 降级方案
@@ -1885,12 +2273,25 @@ async function serveUploadPage() {
         textArea.select();
         try {
           document.execCommand('copy');
-          button.textContent = '✓ 已复制';
-          button.classList.add('copied');
-          setTimeout(() => {
-            button.textContent = '📋 复制';
-            button.classList.remove('copied');
-          }, 2000);
+          const isPasswordDiv = element.classList.contains('password-value');
+
+          if (isPasswordDiv) {
+            const originalContent = element.innerHTML;
+            element.innerHTML = '✓ 已复制！';
+            element.style.background = 'linear-gradient(135deg, #a8e6cf 0%, #56cc9d 100%)';
+
+            setTimeout(() => {
+              element.innerHTML = originalContent;
+              element.style.background = '';
+            }, 1500);
+          } else {
+            element.textContent = '✓ 已复制';
+            element.classList.add('copied');
+            setTimeout(() => {
+              element.textContent = '📋 复制';
+              element.classList.remove('copied');
+            }, 2000);
+          }
         } catch (err2) {
           alert('复制失败，请手动复制');
         }
@@ -2430,7 +2831,7 @@ async function serveDownloadPage(fileId, env) {
     <div class="file-info">
       <p><strong>文件名称：</strong><span id="fileName">${metadata.fileName}</span></p>
       <p><strong>文件大小：</strong><span id="fileSize">${formatFileSize(metadata.fileSize)}</span></p>
-      <p><strong>上传时间：</strong><span id="uploadTime">${formatDate(metadata.createdAt)}</span></p>
+      <p><strong>上传时间：</strong><span id="uploadTime">${formatDate(metadata.uploadedAt)}</span></p>
     </div>
 
     <div id="result" class="result"></div>
