@@ -341,6 +341,8 @@ async function serveUploadPage() {
     .cancel-upload:hover { background: #c82333; }
     .upload-warning { margin-top: 10px; padding: 10px 15px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 6px; color: #856404; font-size: 13px; display: none; text-align: center; }
     .upload-warning strong { color: #d9534f; }
+    .file-processing { margin-top: 10px; padding: 8px 12px; background: #e7f3ff; border: 1px solid #b3d9ff; border-radius: 6px; color: #004085; font-size: 12px; display: none; }
+    .file-processing .file-name { font-weight: 500; color: #007bff; display: block; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
     /* 平板电脑适配 */
     @media (max-width: 768px) {
@@ -371,6 +373,8 @@ async function serveUploadPage() {
       .progress-info .right { text-align: left; }
       .cancel-upload { padding: 8px 16px; font-size: 12px; }
       .upload-warning { font-size: 12px; padding: 8px 12px; }
+      .file-processing { font-size: 11px; padding: 6px 10px; }
+      .file-processing .file-name { font-size: 11px; }
     }
 
     /* 小屏幕手机适配 */
@@ -418,6 +422,10 @@ async function serveUploadPage() {
           <span id="timeRemaining">预计时间: --</span>
         </div>
       </div>
+      <div class="file-processing" id="fileProcessing">
+        <span id="processingStatus">正在处理文件...</span>
+        <span class="file-name" id="processingFileName"></span>
+      </div>
       <div class="upload-warning" id="uploadWarning">
         <strong>⚠️ 警告：</strong>上传未完成，请勿关闭或刷新页面，否则会丢失所有已上传内容！
       </div>
@@ -441,6 +449,9 @@ async function serveUploadPage() {
     const timeRemaining = document.getElementById('timeRemaining');
     const cancelBtn = document.getElementById('cancelBtn');
     const uploadWarning = document.getElementById('uploadWarning');
+    const fileProcessing = document.getElementById('fileProcessing');
+    const processingStatus = document.getElementById('processingStatus');
+    const processingFileName = document.getElementById('processingFileName');
 
     let uploadXHR = null; // 用于取消上传
     let isUploading = false; // 标记是否正在上传
@@ -505,6 +516,7 @@ async function serveUploadPage() {
         progress.style.display = 'none';
         cancelBtn.style.display = 'none';
         uploadWarning.style.display = 'none'; // 隐藏警告
+        fileProcessing.style.display = 'none'; // 隐藏文件处理信息
         showMessage('上传已取消', 'error');
       }
     });
@@ -556,46 +568,102 @@ async function serveUploadPage() {
 
         if (needZip) {
           // 需要打包多个文件或单个非zip文件
-          submitBtn.textContent = '正在打包文件...';
-          progressFill.style.width = '10%';
-          progressFill.textContent = '10%';
-          progressSize.textContent = '正在准备文件...';
+          submitBtn.textContent = '正在准备文件...';
+          progressFill.style.width = '5%';
+          progressFill.textContent = '5%';
+          progressSize.textContent = '准备打包...';
           uploadSpeed.textContent = '--';
           timeRemaining.textContent = '预计时间: --';
+          fileProcessing.style.display = 'block';
 
           const zip = new JSZip();
+          const totalFiles = files.length;
+          let totalSize = 0;
 
-          // 添加所有文件到zip
+          // 第一阶段：添加文件到zip
+          submitBtn.textContent = '正在添加文件...';
+          processingStatus.textContent = \`添加文件到压缩包 (0/\${totalFiles})\`;
+
           for (let i = 0; i < files.length; i++) {
             const file = files[i];
+
+            // 显示当前处理的文件名
+            processingStatus.textContent = \`添加文件到压缩包 (\${i + 1}/\${totalFiles})\`;
+            processingFileName.textContent = file.name;
+
+            // 添加文件
             zip.file(file.name, file);
-            const percent = 10 + (i + 1) / files.length * 30;
+            totalSize += file.size;
+
+            // 更新进度条 (5% - 35%)
+            const percent = 5 + (i + 1) / files.length * 30;
             progressFill.style.width = percent + '%';
             progressFill.textContent = Math.round(percent) + '%';
-            progressSize.textContent = \`添加文件 \${i + 1}/\${files.length}\`;
+            progressSize.textContent = \`\${i + 1}/\${totalFiles} 文件 · \${formatBytes(totalSize)}\`;
+
+            // 短暂延迟让UI更新（对于大量小文件）
+            if (i % 10 === 0) {
+              await new Promise(resolve => setTimeout(resolve, 0));
+            }
           }
 
-          // 生成zip文件
-          submitBtn.textContent = '正在生成压缩包...';
+          // 第二阶段：生成压缩包
+          submitBtn.textContent = '正在压缩文件...';
+          processingStatus.textContent = '压缩中...';
+          processingFileName.textContent = \`总大小: \${formatBytes(totalSize)}\`;
+
+          let lastUpdateTime = Date.now();
+
           const zipBlob = await zip.generateAsync({
             type: 'blob',
             compression: 'DEFLATE',
             compressionOptions: { level: 6 }
           }, (metadata) => {
-            const percent = 40 + metadata.percent * 0.3;
-            progressFill.style.width = percent + '%';
-            progressFill.textContent = Math.round(percent) + '%';
-            progressSize.textContent = \`压缩中: \${Math.round(metadata.percent)}%\`;
+            const currentTime = Date.now();
+
+            // 限制更新频率，避免过于频繁
+            if (currentTime - lastUpdateTime > 100) {
+              const percent = 35 + metadata.percent * 0.35;
+              progressFill.style.width = percent + '%';
+              progressFill.textContent = Math.round(percent) + '%';
+
+              // 显示当前处理的文件
+              if (metadata.currentFile) {
+                processingStatus.textContent = \`压缩中: \${Math.round(metadata.percent)}%\`;
+                processingFileName.textContent = metadata.currentFile;
+              } else {
+                processingStatus.textContent = \`生成压缩包: \${Math.round(metadata.percent)}%\`;
+                processingFileName.textContent = '正在优化文件结构...';
+              }
+
+              progressSize.textContent = \`压缩进度: \${Math.round(metadata.percent)}%\`;
+
+              lastUpdateTime = currentTime;
+            }
           });
 
           fileToUpload = new File([zipBlob], 'files.zip', { type: 'application/zip' });
+
+          // 压缩完成
+          processingStatus.textContent = '✓ 压缩完成';
+          processingFileName.textContent = \`已生成: files.zip (\${formatBytes(zipBlob.size)})\`;
+          progressFill.style.width = '70%';
+          progressFill.textContent = '70%';
+          progressSize.textContent = formatBytes(zipBlob.size);
+
+          // 短暂显示完成状态
+          await new Promise(resolve => setTimeout(resolve, 500));
+
         } else {
           // 单个zip文件，直接使用
           fileToUpload = files[0];
+          progressFill.style.width = '10%';
+          progressFill.textContent = '10%';
         }
 
         // 上传文件
         submitBtn.textContent = '正在上传...';
+        fileProcessing.style.display = 'none'; // 隐藏文件处理信息，显示上传进度
 
         const formData = new FormData();
         formData.append('files', fileToUpload);
@@ -668,6 +736,7 @@ async function serveUploadPage() {
           submitBtn.textContent = '上传文件';
           cancelBtn.style.display = 'none';
           uploadWarning.style.display = 'none'; // 隐藏警告
+          fileProcessing.style.display = 'none'; // 隐藏文件处理信息
           setTimeout(() => {
             progress.style.display = 'none';
           }, 3000);
@@ -681,6 +750,7 @@ async function serveUploadPage() {
           submitBtn.textContent = '上传文件';
           cancelBtn.style.display = 'none';
           uploadWarning.style.display = 'none'; // 隐藏警告
+          fileProcessing.style.display = 'none'; // 隐藏文件处理信息
           progress.style.display = 'none';
         });
 
@@ -701,6 +771,7 @@ async function serveUploadPage() {
         submitBtn.textContent = '上传文件';
         cancelBtn.style.display = 'none';
         uploadWarning.style.display = 'none'; // 隐藏警告
+        fileProcessing.style.display = 'none'; // 隐藏文件处理信息
         progress.style.display = 'none';
       }
     });
