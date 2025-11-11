@@ -1,6 +1,7 @@
 /**
  * FastFile - Cloudflare Workers 主入口
  * R2 Multipart Upload 优化版本 (使用aws4fetch)
+ * 带监控和日志支持
  */
 
 import { AwsClient } from 'aws4fetch';
@@ -15,6 +16,13 @@ import {
   jsonResponse,
   errorResponse
 } from './utils.js';
+import {
+  createLogger,
+  generateRequestId,
+  MetricsTracker,
+  RequestTracker,
+  UploadSessionTracker
+} from './logger.js';
 
 // 用于存储压缩进度的临时状态
 const compressionProgress = new Map();

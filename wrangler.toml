@@ -28,7 +28,13 @@ bucket_name = "fastfile-storage"
 crons = ["0 0 * * *"]  # 每天00:00执行清理任务
 
 # 自定义域名配置
-routes = [
-  { pattern = "file.zwi.monster/*", zone_name = "zwi.monster" }
-]
+# routes = [
+#   { pattern = "file.zwi.monster/*", zone_name = "zwi.monster" }
+# ]
 
+[observability]
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
+persist = true
