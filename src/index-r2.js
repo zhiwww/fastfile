@@ -872,7 +872,10 @@ async function handleMultipleFiles(uploadId, uploadMeta, env) {
   let currentChunkBuffer = [];
   let currentChunkSize = 0;
   let partNumber = 1;
-  const MIN_PART_SIZE = 5 * 1024 * 1024; // R2 最小分块 5MB
+
+  // 🔧 R2 严格要求：除最后一个 part 外，所有 parts 必须大小完全相同
+  const STANDARD_PART_SIZE = 50 * 1024 * 1024; // 50MB - 标准 part 大小
+  const MIN_PART_SIZE = 5 * 1024 * 1024; // 5MB - R2 最小要求（仅用于最后一个 part）
 
   // 🎯 创建流式 ZIP 生成器（边生成边上传到 R2）
   let zipError = null;
@@ -893,11 +896,18 @@ async function handleMultipleFiles(uploadId, uploadMeta, env) {
       currentChunkBuffer.push(chunk);
       currentChunkSize += chunk.byteLength;
 
-      // 当缓冲区 >= 5MB 时，上传一个 part
-      if (currentChunkSize >= MIN_PART_SIZE) {
-        const partData = mergeUint8Arrays(currentChunkBuffer);
-        const currentPartNumber = partNumber++;  // 先递增，避免竞态条件
-        console.log(`⬆️ [MultiFile] Uploading part ${currentPartNumber}: ${partData.byteLength} bytes`);
+      // 🔧 当缓冲区 >= STANDARD_PART_SIZE 时，上传精确大小的 part
+      // 这确保所有非最后一个 part 的大小完全相同
+      while (currentChunkSize >= STANDARD_PART_SIZE) {
+        // 合并所有 chunks
+        const allData = mergeUint8Arrays(currentChunkBuffer);
+
+        // 取出精确的 STANDARD_PART_SIZE
+        const partData = allData.slice(0, STANDARD_PART_SIZE);
+        const remainingData = allData.slice(STANDARD_PART_SIZE);
+
+        const currentPartNumber = partNumber++;
+        console.log(`⬆️ [MultiFile] Uploading part ${currentPartNumber}: ${partData.byteLength} bytes (standard size)`);
 
         // 🔧 创建上传 Promise 并收集起来
         const uploadPromise = (async () => {
@@ -911,8 +921,14 @@ async function handleMultipleFiles(uploadId, uploadMeta, env) {
         })();
         pendingUploads.push(uploadPromise);
 
-        currentChunkBuffer = [];
-        currentChunkSize = 0;
+        // 剩余数据放回缓冲区
+        if (remainingData.byteLength > 0) {
+          currentChunkBuffer = [remainingData];
+          currentChunkSize = remainingData.byteLength;
+        } else {
+          currentChunkBuffer = [];
+          currentChunkSize = 0;
+        }
       }
     }
 
@@ -920,9 +936,10 @@ async function handleMultipleFiles(uploadId, uploadMeta, env) {
       console.log(`✅ [MultiFile] ZIP stream finalized`);
 
       // 上传最后的缓冲区（如果有）
+      // 最后一个 part 可以小于 STANDARD_PART_SIZE
       if (currentChunkSize > 0) {
         const partData = mergeUint8Arrays(currentChunkBuffer);
-        const currentPartNumber = partNumber++;  // 先递增，避免竞态条件
+        const currentPartNumber = partNumber++;
         console.log(`⬆️ [MultiFile] Uploading final part ${currentPartNumber}: ${partData.byteLength} bytes`);
 
         // 🔧 创建上传 Promise 并收集起来
