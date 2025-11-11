@@ -331,8 +331,16 @@ async function serveUploadPage() {
     .download-link { margin-top: 10px; word-break: break-all; }
     .download-link a { color: #007bff; text-decoration: none; }
     .progress { margin-top: 20px; display: none; }
-    .progress-bar { width: 100%; height: 36px; background: #f0f0f0; border-radius: 18px; overflow: hidden; }
-    .progress-fill { height: 100%; background: #007bff; transition: width 0.3s; text-align: center; color: white; line-height: 36px; font-weight: 500; }
+    .progress-bar { width: 100%; height: 36px; background: #f0f0f0; border-radius: 18px; overflow: hidden; position: relative; }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, #007bff 0%, #0056b3 100%); transition: width 0.3s; text-align: center; color: white; line-height: 36px; font-weight: 500; position: relative; }
+    .progress-info { margin-top: 10px; font-size: 13px; color: #666; display: flex; justify-content: space-between; align-items: center; }
+    .progress-info .left { text-align: left; }
+    .progress-info .right { text-align: right; }
+    .upload-speed { font-weight: 500; color: #007bff; }
+    .cancel-upload { margin-top: 10px; padding: 10px 20px; background: #dc3545; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; }
+    .cancel-upload:hover { background: #c82333; }
+    .upload-warning { margin-top: 10px; padding: 10px 15px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 6px; color: #856404; font-size: 13px; display: none; text-align: center; }
+    .upload-warning strong { color: #d9534f; }
 
     /* 平板电脑适配 */
     @media (max-width: 768px) {
@@ -359,6 +367,10 @@ async function serveUploadPage() {
       .message { padding: 12px; font-size: 13px; }
       .progress-bar { height: 32px; }
       .progress-fill { line-height: 32px; font-size: 13px; }
+      .progress-info { font-size: 11px; flex-direction: column; gap: 5px; align-items: flex-start; }
+      .progress-info .right { text-align: left; }
+      .cancel-upload { padding: 8px 16px; font-size: 12px; }
+      .upload-warning { font-size: 12px; padding: 8px 12px; }
     }
 
     /* 小屏幕手机适配 */
@@ -397,6 +409,19 @@ async function serveUploadPage() {
       <div class="progress-bar">
         <div class="progress-fill" id="progressFill">0%</div>
       </div>
+      <div class="progress-info">
+        <div class="left">
+          <span id="progressSize">0 MB / 0 MB</span>
+        </div>
+        <div class="right">
+          <span class="upload-speed" id="uploadSpeed">0 KB/s</span> ·
+          <span id="timeRemaining">预计时间: --</span>
+        </div>
+      </div>
+      <div class="upload-warning" id="uploadWarning">
+        <strong>⚠️ 警告：</strong>上传未完成，请勿关闭或刷新页面，否则会丢失所有已上传内容！
+      </div>
+      <button type="button" class="cancel-upload" id="cancelBtn" style="display: none;">取消上传</button>
     </div>
 
     <div class="message" id="message"></div>
@@ -411,6 +436,14 @@ async function serveUploadPage() {
     const progressFill = document.getElementById('progressFill');
     const passwordInput = document.getElementById('password');
     const generateBtn = document.getElementById('generateBtn');
+    const progressSize = document.getElementById('progressSize');
+    const uploadSpeed = document.getElementById('uploadSpeed');
+    const timeRemaining = document.getElementById('timeRemaining');
+    const cancelBtn = document.getElementById('cancelBtn');
+    const uploadWarning = document.getElementById('uploadWarning');
+
+    let uploadXHR = null; // 用于取消上传
+    let isUploading = false; // 标记是否正在上传
 
     // 生成4位随机数字密码
     function generatePassword() {
@@ -432,6 +465,48 @@ async function serveUploadPage() {
     // 点击密码输入框时自动全选，方便复制
     passwordInput.addEventListener('click', function() {
       this.select();
+    });
+
+    // 格式化文件大小
+    function formatBytes(bytes) {
+      if (bytes === 0) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB', 'GB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return (bytes / Math.pow(k, i)).toFixed(2) + ' ' + sizes[i];
+    }
+
+    // 格式化时间
+    function formatTime(seconds) {
+      if (!isFinite(seconds) || seconds < 0) return '--';
+      if (seconds < 60) return Math.round(seconds) + ' 秒';
+      if (seconds < 3600) return Math.round(seconds / 60) + ' 分钟';
+      return Math.round(seconds / 3600) + ' 小时';
+    }
+
+    // 防止用户在上传时误关闭页面
+    window.addEventListener('beforeunload', function(e) {
+      if (isUploading) {
+        e.preventDefault();
+        // 现代浏览器会使用自己的提示文字，但我们仍然需要设置returnValue
+        e.returnValue = '⚠️ 上传未完成，离开网页会丢失所有已上传内容！确定要离开吗？';
+        return e.returnValue;
+      }
+    });
+
+    // 取消上传
+    cancelBtn.addEventListener('click', function() {
+      if (uploadXHR) {
+        uploadXHR.abort();
+        uploadXHR = null;
+        isUploading = false;
+        submitBtn.disabled = false;
+        submitBtn.textContent = '上传文件';
+        progress.style.display = 'none';
+        cancelBtn.style.display = 'none';
+        uploadWarning.style.display = 'none'; // 隐藏警告
+        showMessage('上传已取消', 'error');
+      }
     });
 
     form.addEventListener('submit', async (e) => {
@@ -464,6 +539,14 @@ async function serveUploadPage() {
       submitBtn.disabled = true;
       progress.style.display = 'block';
       message.style.display = 'none';
+      isUploading = true;
+      cancelBtn.style.display = 'block';
+      uploadWarning.style.display = 'block'; // 显示警告信息
+
+      // 上传进度追踪变量
+      let startTime = Date.now();
+      let lastLoaded = 0;
+      let lastTime = startTime;
 
       try {
         let fileToUpload;
@@ -474,7 +557,11 @@ async function serveUploadPage() {
         if (needZip) {
           // 需要打包多个文件或单个非zip文件
           submitBtn.textContent = '正在打包文件...';
-          updateProgress(10);
+          progressFill.style.width = '10%';
+          progressFill.textContent = '10%';
+          progressSize.textContent = '正在准备文件...';
+          uploadSpeed.textContent = '--';
+          timeRemaining.textContent = '预计时间: --';
 
           const zip = new JSZip();
 
@@ -482,7 +569,10 @@ async function serveUploadPage() {
           for (let i = 0; i < files.length; i++) {
             const file = files[i];
             zip.file(file.name, file);
-            updateProgress(10 + (i + 1) / files.length * 30);
+            const percent = 10 + (i + 1) / files.length * 30;
+            progressFill.style.width = percent + '%';
+            progressFill.textContent = Math.round(percent) + '%';
+            progressSize.textContent = \`添加文件 \${i + 1}/\${files.length}\`;
           }
 
           // 生成zip文件
@@ -492,7 +582,10 @@ async function serveUploadPage() {
             compression: 'DEFLATE',
             compressionOptions: { level: 6 }
           }, (metadata) => {
-            updateProgress(40 + metadata.percent * 0.3);
+            const percent = 40 + metadata.percent * 0.3;
+            progressFill.style.width = percent + '%';
+            progressFill.textContent = Math.round(percent) + '%';
+            progressSize.textContent = \`压缩中: \${Math.round(metadata.percent)}%\`;
           });
 
           fileToUpload = new File([zipBlob], 'files.zip', { type: 'application/zip' });
@@ -503,48 +596,114 @@ async function serveUploadPage() {
 
         // 上传文件
         submitBtn.textContent = '正在上传...';
-        updateProgress(80);
 
         const formData = new FormData();
         formData.append('files', fileToUpload);
         formData.append('password', password);
 
-        const response = await fetch('/api/upload', {
-          method: 'POST',
-          body: formData,
+        const totalFileSize = fileToUpload.size;
+
+        // 使用XMLHttpRequest以支持上传进度追踪
+        uploadXHR = new XMLHttpRequest();
+
+        // 上传进度事件
+        uploadXHR.upload.addEventListener('progress', function(e) {
+          if (e.lengthComputable) {
+            const percent = (e.loaded / e.total) * 100;
+            const currentTime = Date.now();
+            const timeDiff = (currentTime - lastTime) / 1000; // 秒
+            const loadedDiff = e.loaded - lastLoaded;
+
+            // 更新进度条
+            progressFill.style.width = percent + '%';
+            progressFill.textContent = Math.round(percent) + '%';
+
+            // 更新文件大小显示
+            progressSize.textContent = formatBytes(e.loaded) + ' / ' + formatBytes(e.total);
+
+            // 计算上传速度（每0.5秒更新一次）
+            if (timeDiff >= 0.5) {
+              const speed = loadedDiff / timeDiff; // 字节/秒
+              uploadSpeed.textContent = formatBytes(speed) + '/s';
+
+              // 计算剩余时间
+              const remaining = (e.total - e.loaded) / speed;
+              timeRemaining.textContent = '剩余: ' + formatTime(remaining);
+
+              lastLoaded = e.loaded;
+              lastTime = currentTime;
+            }
+          }
         });
 
-        const result = await response.json();
+        // 上传完成事件
+        uploadXHR.addEventListener('load', function() {
+          if (uploadXHR.status >= 200 && uploadXHR.status < 300) {
+            try {
+              const result = JSON.parse(uploadXHR.responseText);
 
-        if (result.success) {
-          updateProgress(100);
-          const downloadUrl = window.location.origin + result.downloadUrl;
-          showMessage(
-            \`✅ 上传成功！<br><br><strong style="color: #d9534f;">⚠️ 请务必记录以下信息：</strong><br><br><strong>下载链接：</strong><div class="download-link"><a href="\${downloadUrl}" target="_blank">\${downloadUrl}</a></div><br><strong style="font-size: 18px; color: #d9534f;">密码：\${password}</strong><br><br>💡 链接30天内有效，请妥善保管密码！\`,
-            'success'
-          );
-          form.reset();
-          // 重新生成新密码供下次使用
-          generatePassword();
-        } else {
-          showMessage('上传失败: ' + (result.error || '未知错误'), 'error');
-        }
+              if (result.success) {
+                progressFill.style.width = '100%';
+                progressFill.textContent = '100%';
+                isUploading = false;
+
+                const downloadUrl = window.location.origin + result.downloadUrl;
+                showMessage(
+                  \`✅ 上传成功！<br><br><strong style="color: #d9534f;">⚠️ 请务必记录以下信息：</strong><br><br><strong>下载链接：</strong><div class="download-link"><a href="\${downloadUrl}" target="_blank">\${downloadUrl}</a></div><br><strong style="font-size: 18px; color: #d9534f;">密码：\${password}</strong><br><br>💡 链接30天内有效，请妥善保管密码！\`,
+                  'success'
+                );
+                form.reset();
+                generatePassword();
+              } else {
+                showMessage('上传失败: ' + (result.error || '未知错误'), 'error');
+              }
+            } catch (error) {
+              showMessage('上传失败: 无法解析服务器响应', 'error');
+            }
+          } else {
+            showMessage('上传失败: HTTP ' + uploadXHR.status, 'error');
+          }
+
+          submitBtn.disabled = false;
+          submitBtn.textContent = '上传文件';
+          cancelBtn.style.display = 'none';
+          uploadWarning.style.display = 'none'; // 隐藏警告
+          setTimeout(() => {
+            progress.style.display = 'none';
+          }, 3000);
+        });
+
+        // 上传错误事件
+        uploadXHR.addEventListener('error', function() {
+          isUploading = false;
+          showMessage('上传失败: 网络错误', 'error');
+          submitBtn.disabled = false;
+          submitBtn.textContent = '上传文件';
+          cancelBtn.style.display = 'none';
+          uploadWarning.style.display = 'none'; // 隐藏警告
+          progress.style.display = 'none';
+        });
+
+        // 上传被中止事件
+        uploadXHR.addEventListener('abort', function() {
+          isUploading = false;
+          // 取消按钮已经处理了UI更新
+        });
+
+        // 发送请求
+        uploadXHR.open('POST', '/api/upload');
+        uploadXHR.send(formData);
+
       } catch (error) {
-        showMessage('上传失败: ' + error.message, 'error');
-      } finally {
+        isUploading = false;
+        showMessage('处理失败: ' + error.message, 'error');
         submitBtn.disabled = false;
         submitBtn.textContent = '上传文件';
-        setTimeout(() => {
-          progress.style.display = 'none';
-          updateProgress(0);
-        }, 2000);
+        cancelBtn.style.display = 'none';
+        uploadWarning.style.display = 'none'; // 隐藏警告
+        progress.style.display = 'none';
       }
     });
-
-    function updateProgress(percent) {
-      progressFill.style.width = percent + '%';
-      progressFill.textContent = Math.round(percent) + '%';
-    }
 
     function showMessage(text, type) {
       message.innerHTML = text;
