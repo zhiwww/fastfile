@@ -2,6 +2,10 @@ name = "fastfile"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
+# CPU时间限制: 5分钟
+# 足够处理10GB文件的压缩（预计需要约1.2-2.3分钟）
+limits = { cpu_ms = 300000 }
+
 # KV命名空间用于存储文件元数据
 [[kv_namespaces]]
 binding = "FILE_META"
