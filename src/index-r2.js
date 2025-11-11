@@ -162,18 +162,33 @@ async function parseXmlResponse(response) {
 
 export default {
   async fetch(request, env, ctx) {
+    // 初始化监控
+    const requestId = generateRequestId();
+    const logger = createLogger(env);
+    const metrics = new MetricsTracker();
+    const tracker = new RequestTracker(requestId, logger, metrics);
+
     const url = new URL(request.url);
     const path = url.pathname;
 
+    tracker.event('request.start', {
+      method: request.method,
+      path,
+      userAgent: request.headers.get('user-agent')
+    });
+
     // CORS预检请求
     if (request.method === 'OPTIONS') {
-      return new Response(null, {
+      const response = new Response(null, {
         headers: {
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type',
         },
       });
+      tracker.finish(200, { type: 'CORS preflight' });
+      ctx.waitUntil(metrics.flush(logger));
+      return response;
     }
 
     // 路由处理
@@ -182,48 +197,81 @@ export default {
       if (path.startsWith('/api/')) {
         // R2 Multipart Upload 路由
         if (path === '/api/upload/init' && request.method === 'POST') {
-          return await handleUploadInit(request, env);
+          const response = await handleUploadInit(request, env, logger, metrics);
+          tracker.finish(response.status, { handler: 'upload.init' });
+          ctx.waitUntil(metrics.flush(logger));
+          return response;
         }
 
         if (path === '/api/upload/chunk' && request.method === 'POST') {
-          return await handleUploadChunk(request, env);
+          const response = await handleUploadChunk(request, env, logger, metrics);
+          tracker.finish(response.status, { handler: 'upload.chunk' });
+          ctx.waitUntil(metrics.flush(logger));
+          return response;
         }
 
         if (path === '/api/upload/complete' && request.method === 'POST') {
-          return await handleUploadComplete(request, env, ctx);
+          const response = await handleUploadComplete(request, env, ctx, logger, metrics);
+          tracker.finish(response.status, { handler: 'upload.complete' });
+          ctx.waitUntil(metrics.flush(logger));
+          return response;
         }
 
         if (path === '/api/verify' && request.method === 'POST') {
-          return await handleVerify(request, env);
+          const response = await handleVerify(request, env);
+          tracker.finish(response.status, { handler: 'verify' });
+          ctx.waitUntil(metrics.flush(logger));
+          return response;
         }
 
         if (path.startsWith('/api/download/')) {
           const fileId = path.split('/')[3];
-          return await handleDownload(fileId, request, env);
+          const response = await handleDownload(fileId, request, env);
+          tracker.finish(response.status, { handler: 'download', fileId });
+          ctx.waitUntil(metrics.flush(logger));
+          return response;
         }
 
         if (path.startsWith('/api/upload-status/')) {
           const uploadId = path.split('/')[3];
-          return await handleUploadStatus(uploadId, env);
+          const response = await handleUploadStatus(uploadId, env);
+          tracker.finish(response.status, { handler: 'upload-status', uploadId });
+          ctx.waitUntil(metrics.flush(logger));
+          return response;
         }
 
-        return errorResponse('API端点不存在', 404);
+        const response = errorResponse('API端点不存在', 404);
+        tracker.finish(404, { handler: 'not_found' });
+        ctx.waitUntil(metrics.flush(logger));
+        return response;
       }
 
       // 下载页面路由
       if (path.startsWith('/d/')) {
         const fileId = path.split('/')[2];
-        return await serveDownloadPage(fileId, env);
+        const response = await serveDownloadPage(fileId, env);
+        tracker.finish(response.status, { handler: 'download-page', fileId });
+        ctx.waitUntil(metrics.flush(logger));
+        return response;
       }
 
       // 默认返回上传页面
       if (path === '/' || path === '/index.html') {
-        return await serveUploadPage();
+        const response = await serveUploadPage();
+        tracker.finish(response.status, { handler: 'upload-page' });
+        ctx.waitUntil(metrics.flush(logger));
+        return response;
       }
 
-      return errorResponse('页面不存在', 404);
+      const response = errorResponse('页面不存在', 404);
+      tracker.finish(404, { handler: 'not_found' });
+      ctx.waitUntil(metrics.flush(logger));
+      return response;
     } catch (error) {
-      console.error('Error:', error);
+      tracker.error(error, { path });
+      tracker.finish(500, { error: error.message });
+      logger.fatal('Request failed', { error, requestId, url: request.url });
+      ctx.waitUntil(metrics.flush(logger));
       return errorResponse('服务器错误: ' + error.message, 500);
     }
   },
@@ -237,12 +285,21 @@ export default {
 /**
  * 初始化分块上传 (Phase 1)
  */
-async function handleUploadInit(request, env) {
+async function handleUploadInit(request, env, logger, metrics) {
+  const requestLogger = logger ? logger.child({ handler: 'upload.init' }) : { info: () => {}, warn: () => {}, error: () => {} };
+
   try {
     const { files, password } = await request.json();
 
+    requestLogger.info('Upload init request', {
+      filesCount: files.length,
+      totalSize: files.reduce((sum, f) => sum + f.size, 0)
+    });
+
     // 验证密码
     if (!password || !isValidPassword(password)) {
+      requestLogger.warn('Invalid password provided');
+      if (metrics) metrics.increment('upload.init.invalid_password', 1);
       return errorResponse('密码必须是4位数字');
     }
 
@@ -333,7 +390,10 @@ async function handleUploadInit(request, env) {
 /**
  * 上传单个分块
  */
-async function handleUploadChunk(request, env) {
+async function handleUploadChunk(request, env, logger, metrics) {
+  const requestLogger = logger ? logger.child({ handler: 'upload.chunk' }) : { info: () => {}, debug: () => {}, error: () => {} };
+  const startTime = Date.now();
+
   try {
     const formData = await request.formData();
     const uploadId = formData.get('uploadId');
@@ -417,7 +477,9 @@ async function handleUploadChunk(request, env) {
 /**
  * 完成上传并触发压缩
  */
-async function handleUploadComplete(request, env, ctx) {
+async function handleUploadComplete(request, env, ctx, logger, metrics) {
+  const requestLogger = logger ? logger.child({ handler: 'upload.complete' }) : { info: () => {}, error: () => {} };
+
   try {
     const { uploadId } = await request.json();
 
