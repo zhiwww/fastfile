@@ -1,7 +1,7 @@
 name = "fastfile"
 main = "src/index-r2.js"
 compatibility_date = "2024-01-01"
-
+logpush = true
 # CPU时间限制: 5分钟
 # 足够处理10GB文件的压缩（预计需要约1.2-2.3分钟）
 limits = { cpu_ms = 300000 }
@@ -38,3 +38,9 @@ enabled = true
 head_sampling_rate = 1
 invocation_logs = true
 persist = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
+
