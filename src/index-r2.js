@@ -27,10 +27,22 @@ import {
 // 用于存储压缩进度的临时状态
 const compressionProgress = new Map();
 
-// 分块配置
-const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk (R2最小5MB)
-const MAX_RETRY_ATTEMPTS = 5; // 最大重试次数（增加到5次）
-const RETRY_DELAY_BASE = 1000; // 基础重试延迟(ms)
+// =============================================
+// 统一配置 - 前后端共享
+// =============================================
+const CONFIG = {
+  CHUNK_SIZE: 10 * 1024 * 1024, // 10MB - R2 multipart 要求每个 part 至少 5MB（除最后一个）
+  MAX_CONCURRENT: 4, // 最大并发上传数
+  MAX_RETRY_ATTEMPTS: 5, // 最大重试次数
+  RETRY_DELAY_BASE: 1000, // 基础重试延迟(ms)
+};
+
+// R2 multipart upload 限制
+const R2_LIMITS = {
+  MIN_PART_SIZE: 5 * 1024 * 1024, // 5MB - R2 要求的最小 part 大小（除最后一个）
+  MAX_PART_SIZE: 5 * 1024 * 1024 * 1024, // 5GB - 单个 part 的最大大小
+  MAX_PARTS: 10000, // 最大 part 数量
+};
 
 /**
  * 判断错误是否可重试
@@ -81,7 +93,7 @@ function isRetryableError(error, statusCode) {
 /**
  * 指数退避重试函数
  */
-async function retryWithBackoff(fn, maxAttempts = MAX_RETRY_ATTEMPTS, operation = 'operation') {
+async function retryWithBackoff(fn, maxAttempts = CONFIG.MAX_RETRY_ATTEMPTS, operation = 'operation') {
   let lastError;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -106,7 +118,7 @@ async function retryWithBackoff(fn, maxAttempts = MAX_RETRY_ATTEMPTS, operation 
       }
 
       // 计算退避延迟: base * 2^(attempt-1) + random jitter
-      const baseDelay = RETRY_DELAY_BASE * Math.pow(2, attempt - 1);
+      const baseDelay = CONFIG.RETRY_DELAY_BASE * Math.pow(2, attempt - 1);
       const jitter = Math.random() * 1000; // 0-1秒的随机抖动
       const delay = baseDelay + jitter;
 
@@ -286,7 +298,7 @@ export default {
  * 初始化分块上传 (Phase 1)
  */
 async function handleUploadInit(request, env, logger, metrics) {
-  const requestLogger = logger ? logger.child({ handler: 'upload.init' }) : { info: () => {}, warn: () => {}, error: () => {} };
+  const requestLogger = logger ? logger.child({ handler: 'upload.init' }) : { info: () => { }, warn: () => { }, error: () => { } };
 
   try {
     const { files, password } = await request.json();
@@ -340,19 +352,19 @@ async function handleUploadInit(request, env, logger, metrics) {
 
           return await parseXmlResponse(createResponse);
         },
-        MAX_RETRY_ATTEMPTS,
+        CONFIG.MAX_RETRY_ATTEMPTS,
         `Create multipart upload for ${file.name}`
       );
 
-      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+      const totalChunks = Math.ceil(file.size / CONFIG.CHUNK_SIZE);
 
       fileUploads.push({
         name: file.name,
         size: file.size,
         key: tempKey,
         uploadId: xmlResult.UploadId,
-        totalChunks,
-        uploadedChunks: []
+        totalChunks
+        // 注意：不再使用 uploadedChunks 数组，改为独立的 KV 记录
       });
     }
 
@@ -378,7 +390,7 @@ async function handleUploadInit(request, env, logger, metrics) {
         uploadId: f.uploadId
       })),
       isSingleZip,
-      chunkSize: CHUNK_SIZE
+      chunkSize: CONFIG.CHUNK_SIZE
     });
 
   } catch (error) {
@@ -391,7 +403,7 @@ async function handleUploadInit(request, env, logger, metrics) {
  * 上传单个分块
  */
 async function handleUploadChunk(request, env, logger, metrics) {
-  const requestLogger = logger ? logger.child({ handler: 'upload.chunk' }) : { info: () => {}, debug: () => {}, error: () => {} };
+  const requestLogger = logger ? logger.child({ handler: 'upload.chunk' }) : { info: () => { }, debug: () => { }, error: () => { } };
   const startTime = Date.now();
 
   try {
@@ -443,28 +455,47 @@ async function handleUploadChunk(request, env, logger, metrics) {
         const uploadEtag = uploadResponse.headers.get('etag');
         return { response: uploadResponse, etag: uploadEtag };
       },
-      MAX_RETRY_ATTEMPTS,
+      CONFIG.MAX_RETRY_ATTEMPTS,
       `Upload chunk ${partNumber} for ${fileName}`
     );
 
-    // 记录已上传的分块
-    fileUpload.uploadedChunks.push({
+    // 🔧 修复竞态条件：为每个 chunk 单独存储 KV 记录
+    // 避免并发修改同一个元数据对象
+    const chunkKey = `upload:${uploadId}:chunk:${fileName}:${chunkIndex}`;
+    await env.FILE_META.put(chunkKey, JSON.stringify({
       partNumber,
-      etag
+      etag,
+      fileName,
+      chunkIndex,
+      uploadedAt: Date.now()
+    }));
+
+    requestLogger.info('Chunk uploaded and recorded', {
+      uploadId,
+      fileName,
+      chunkIndex,
+      partNumber
     });
 
-    // 更新元数据
-    await env.FILE_META.put(`upload:${uploadId}`, JSON.stringify(meta));
-
-    // 计算总体进度
-    const totalUploaded = meta.files.reduce((sum, f) => sum + f.uploadedChunks.length, 0);
+    // 计算总体进度（从独立的 chunk 记录中统计）
     const totalChunks = meta.files.reduce((sum, f) => sum + f.totalChunks, 0);
-    const progress = (totalUploaded / totalChunks) * 100;
+    let uploadedCount = 0;
+
+    // 统计已上传的 chunks
+    for (const file of meta.files) {
+      for (let i = 0; i < file.totalChunks; i++) {
+        const key = `upload:${uploadId}:chunk:${file.name}:${i}`;
+        const exists = await env.FILE_META.get(key);
+        if (exists) uploadedCount++;
+      }
+    }
+
+    const progress = (uploadedCount / totalChunks) * 100;
 
     return jsonResponse({
       success: true,
-      uploaded: fileUpload.uploadedChunks.length,
-      total: fileUpload.totalChunks,
+      uploaded: uploadedCount,
+      total: totalChunks,
       overallProgress: progress
     });
 
@@ -478,7 +509,7 @@ async function handleUploadChunk(request, env, logger, metrics) {
  * 完成上传并触发压缩
  */
 async function handleUploadComplete(request, env, ctx, logger, metrics) {
-  const requestLogger = logger ? logger.child({ handler: 'upload.complete' }) : { info: () => {}, error: () => {} };
+  const requestLogger = logger ? logger.child({ handler: 'upload.complete' }) : { info: () => { }, error: () => { } };
 
   try {
     const { uploadId } = await request.json();
@@ -491,12 +522,55 @@ async function handleUploadComplete(request, env, ctx, logger, metrics) {
 
     const meta = JSON.parse(metaStr);
 
+    // 🔧 从独立的 chunk KV 记录中读取所有 chunks
+    // 验证所有文件的所有分块都已上传
+    const filesStatus = [];
+
+    for (const fileUpload of meta.files) {
+      const chunks = [];
+
+      // 读取该文件的所有 chunk 记录
+      for (let i = 0; i < fileUpload.totalChunks; i++) {
+        const chunkKey = `upload:${uploadId}:chunk:${fileUpload.name}:${i}`;
+        const chunkDataStr = await env.FILE_META.get(chunkKey);
+
+        if (chunkDataStr) {
+          const chunkData = JSON.parse(chunkDataStr);
+          chunks.push(chunkData);
+        }
+      }
+
+      filesStatus.push({
+        name: fileUpload.name,
+        uploadedChunks: chunks.length,
+        totalChunks: fileUpload.totalChunks
+      });
+
+      // 保存 chunks 到 fileUpload 对象，用于后续完成 multipart upload
+      fileUpload.chunks = chunks;
+    }
+
+    requestLogger.info('Upload complete request', {
+      uploadId,
+      filesCount: meta.files.length,
+      files: filesStatus
+    });
+
     // 验证所有文件的所有分块都已上传
     for (const fileUpload of meta.files) {
-      if (fileUpload.uploadedChunks.length !== fileUpload.totalChunks) {
-        return errorResponse(`文件 ${fileUpload.name} 未完全上传`);
+      if (fileUpload.chunks.length !== fileUpload.totalChunks) {
+        requestLogger.error('File incomplete', {
+          fileName: fileUpload.name,
+          uploadedChunks: fileUpload.chunks.length,
+          totalChunks: fileUpload.totalChunks,
+          missing: fileUpload.totalChunks - fileUpload.chunks.length
+        });
+        if (metrics) metrics.increment('upload.complete.incomplete', 1);
+        return errorResponse(`文件 ${fileUpload.name} 未完全上传: ${fileUpload.chunks.length}/${fileUpload.totalChunks} chunks`);
       }
     }
+
+    requestLogger.info('All chunks verified, completing multipart upload');
 
     // 初始化aws4fetch客户端
     const awsClient = getAwsClient(env);
@@ -505,13 +579,22 @@ async function handleUploadComplete(request, env, ctx, logger, metrics) {
     // 完成所有文件的multipart upload
     for (const fileUpload of meta.files) {
       // 按partNumber排序
-      const sortedParts = fileUpload.uploadedChunks.sort((a, b) => a.partNumber - b.partNumber);
+      const sortedParts = fileUpload.chunks.sort((a, b) => a.partNumber - b.partNumber);
+
+      // 调试：打印所有 parts 信息
+      console.log(`📦 [Complete] File: ${fileUpload.name}, Total parts: ${sortedParts.length}`);
+      sortedParts.forEach(part => {
+        console.log(`  Part ${part.partNumber}: ETag=${part.etag}, ChunkIndex=${part.chunkIndex}`);
+      });
 
       // 构建XML body
       const partsXml = sortedParts
         .map(part => `<Part><PartNumber>${part.partNumber}</PartNumber><ETag>${part.etag}</ETag></Part>`)
         .join('');
       const xmlBody = `<CompleteMultipartUpload>${partsXml}</CompleteMultipartUpload>`;
+
+      console.log(`📝 [Complete] XML Body length: ${xmlBody.length} bytes`);
+      console.log(`📝 [Complete] First 500 chars: ${xmlBody.substring(0, 500)}`);
 
       // 使用重试机制完成multipart upload
       await retryWithBackoff(
@@ -529,14 +612,16 @@ async function handleUploadComplete(request, env, ctx, logger, metrics) {
 
           if (!completeResponse.ok) {
             const errorText = await completeResponse.text();
+            console.error(`❌ [Complete] Error response (${completeResponse.status}): ${errorText}`);
             const error = new Error(`完成multipart upload失败: ${errorText}`);
             error.statusCode = completeResponse.status;
             throw error;
           }
 
+          console.log(`✅ [Complete] Multipart upload completed successfully for ${fileUpload.name}`);
           return completeResponse;
         },
-        MAX_RETRY_ATTEMPTS,
+        CONFIG.MAX_RETRY_ATTEMPTS,
         `Complete multipart upload for ${fileUpload.name}`
       );
     }
@@ -583,7 +668,10 @@ async function handleUploadComplete(request, env, ctx, logger, metrics) {
     }
 
     // 触发压缩任务
-    ctx.waitUntil(performCompression(uploadId, meta, env));
+    console.log(`🚀 [handleUploadComplete] Triggering compression task for uploadId: ${uploadId}`);
+    const compressionPromise = performCompression(uploadId, meta, env);
+    ctx.waitUntil(compressionPromise);
+    console.log(`✅ [handleUploadComplete] Compression task scheduled with ctx.waitUntil()`);
 
     return jsonResponse({
       success: true,
@@ -650,25 +738,63 @@ async function handleUploadStatus(uploadId, env) {
 }
 
 /**
- * 执行实际的压缩操作（从R2读取文件）
+ * 执行实际的压缩操作
+ * 🔧 智能环境检测：
+ * - 生产环境：优先使用 R2 binding (env.FILE_STORAGE) - 更快，无API调用
+ * - 本地开发：自动回退到 S3 API - 因为本地binding指向本地R2，但文件在云端R2
  */
 async function performCompression(uploadId, uploadMeta, env) {
+  console.log(`🔄 [Compression] Starting compression for uploadId: ${uploadId}`);
+
   try {
     uploadMeta.status = 'compressing';
     await env.FILE_META.put(`upload:${uploadId}`, JSON.stringify(uploadMeta));
+    console.log(`✅ [Compression] Status updated to 'compressing'`);
 
     // 准备压缩数据
     const filesToZip = {};
     let processedCount = 0;
 
+    // 🔧 智能环境检测：先尝试R2 binding，失败则使用S3 API
+    let useS3API = false;
+    const awsClient = getAwsClient(env);
+    const r2Url = getR2Url(env);
+
     // 从R2读取所有已上传的文件
+    console.log(`📂 [Compression] Reading ${uploadMeta.files.length} files from R2...`);
     for (const fileInfo of uploadMeta.files) {
-      const obj = await env.FILE_STORAGE.get(fileInfo.key);
-      if (!obj) {
-        throw new Error(`文件不存在: ${fileInfo.name}`);
+      console.log(`🔍 [Compression] Fetching file: ${fileInfo.key}`);
+
+      let fileData;
+
+      // 首先尝试使用 R2 binding（生产环境）
+      if (!useS3API) {
+        try {
+          const r2Object = await env.FILE_STORAGE.get(fileInfo.key);
+          if (r2Object) {
+            fileData = await r2Object.arrayBuffer();
+            console.log(`✅ [Compression] File read via R2 binding: ${fileInfo.name}, size: ${fileData.byteLength} bytes`);
+          } else {
+            // 文件不存在于binding，切换到S3 API
+            console.log(`⚠️ [Compression] File not found in R2 binding, switching to S3 API`);
+            useS3API = true;
+          }
+        } catch (bindingError) {
+          console.log(`⚠️ [Compression] R2 binding error, switching to S3 API: ${bindingError.message}`);
+          useS3API = true;
+        }
       }
 
-      const fileData = await obj.arrayBuffer();
+      // 如果 binding 失败，使用 S3 API（本地开发）
+      if (useS3API || !fileData) {
+        const response = await awsClient.fetch(`${r2Url}/${fileInfo.key}`);
+        if (!response.ok) {
+          throw new Error(`文件不存在: ${fileInfo.name} (HTTP ${response.status})`);
+        }
+        fileData = await response.arrayBuffer();
+        console.log(`✅ [Compression] File read via S3 API: ${fileInfo.name}, size: ${fileData.byteLength} bytes`);
+      }
+
       filesToZip[fileInfo.name] = new Uint8Array(fileData);
 
       processedCount++;
@@ -682,7 +808,11 @@ async function performCompression(uploadId, uploadMeta, env) {
         processedCount,
         totalCount: uploadMeta.files.length,
       });
+      console.log(`📊 [Compression] Progress: ${progress}% (${processedCount}/${uploadMeta.files.length} files read)`);
     }
+
+    console.log(`ℹ️ [Compression] Environment: ${useS3API ? 'Local Dev (S3 API)' : 'Production (R2 Binding)'}`);
+
 
     // 更新进度：开始压缩
     compressionProgress.set(uploadId, {
@@ -690,11 +820,13 @@ async function performCompression(uploadId, uploadMeta, env) {
       progress: 50,
       message: '开始压缩文件...',
     });
+    console.log(`🗜️ [Compression] Starting ZIP compression...`);
 
     // 使用fflate进行同步压缩
     const zipped = zipSync(filesToZip, {
       level: 3, // 压缩级别 0-9，使用3提供快速压缩和适中的压缩率
     });
+    console.log(`✅ [Compression] ZIP compression completed, size: ${zipped.byteLength} bytes`);
 
     // 更新进度：压缩完成，保存文件
     compressionProgress.set(uploadId, {
@@ -702,6 +834,7 @@ async function performCompression(uploadId, uploadMeta, env) {
       progress: 90,
       message: '正在保存压缩文件...',
     });
+    console.log(`💾 [Compression] Saving compressed file to R2...`);
 
     // 生成最终文件ID
     const fileId = generateFileId();
@@ -709,6 +842,7 @@ async function performCompression(uploadId, uploadMeta, env) {
 
     // 存储压缩后的文件到R2
     await env.FILE_STORAGE.put(fileId, zipped);
+    console.log(`✅ [Compression] File saved to R2 with ID: ${fileId}`);
 
     // 保存最终元数据
     const metadata = {
@@ -723,10 +857,27 @@ async function performCompression(uploadId, uploadMeta, env) {
     };
 
     await env.FILE_META.put(fileId, JSON.stringify(metadata));
+    console.log(`✅ [Compression] Metadata saved`);
 
-    // 删除临时文件
+    // 删除临时文件（使用智能环境检测）
+    console.log(`🗑️ [Compression] Deleting ${uploadMeta.files.length} temporary files...`);
     for (const fileInfo of uploadMeta.files) {
-      await env.FILE_STORAGE.delete(fileInfo.key);
+      try {
+        if (useS3API) {
+          // 本地开发：使用 S3 API 删除
+          const deleteResponse = await awsClient.fetch(`${r2Url}/${fileInfo.key}`, {
+            method: 'DELETE'
+          });
+          console.log(`✅ [Compression] Deleted temp file via S3 API: ${fileInfo.key} (status: ${deleteResponse.status})`);
+        } else {
+          // 生产环境：使用 R2 binding 删除
+          await env.FILE_STORAGE.delete(fileInfo.key);
+          console.log(`✅ [Compression] Deleted temp file via R2 binding: ${fileInfo.key}`);
+        }
+      } catch (deleteError) {
+        console.warn(`⚠️ [Compression] Failed to delete temp file: ${fileInfo.key}`, deleteError);
+        // 继续删除其他文件，不要因为一个文件失败而中断
+      }
     }
 
     // 更新上传元数据为已完成
@@ -735,6 +886,7 @@ async function performCompression(uploadId, uploadMeta, env) {
     uploadMeta.compressedAt = Date.now();
     uploadMeta.compressedSize = zipped.byteLength;
     await env.FILE_META.put(`upload:${uploadId}`, JSON.stringify(uploadMeta));
+    console.log(`✅ [Compression] Upload metadata updated to 'completed'`);
 
     // 更新最终进度
     compressionProgress.set(uploadId, {
@@ -743,14 +895,17 @@ async function performCompression(uploadId, uploadMeta, env) {
       fileId,
       downloadUrl: `/d/${fileId}`,
     });
+    console.log(`🎉 [Compression] Compression completed successfully!`);
 
     // 5分钟后清理进度数据
     setTimeout(() => {
       compressionProgress.delete(uploadId);
+      console.log(`🧹 [Compression] Progress data cleaned for uploadId: ${uploadId}`);
     }, 5 * 60 * 1000);
 
   } catch (error) {
-    console.error('Compression error:', error);
+    console.error(`❌ [Compression] ERROR for uploadId ${uploadId}:`, error);
+    console.error(`❌ [Compression] Error stack:`, error.stack);
 
     // 更新状态为失败
     uploadMeta.status = 'failed';
@@ -1073,12 +1228,20 @@ async function serveUploadPage() {
       border: 2px solid #e0e0e0;
       border-radius: 8px;
       font-size: 16px;
-      transition: border-color 0.3s;
+      transition: all 0.3s;
     }
 
     input[type="text"]:focus {
       outline: none;
       border-color: #667eea;
+    }
+
+    input[type="text"]:disabled {
+      background: #f8f9ff;
+      border-color: #667eea;
+      color: #667eea;
+      font-weight: 600;
+      cursor: not-allowed;
     }
 
     button {
@@ -1154,12 +1317,6 @@ async function serveUploadPage() {
       height: 100%;
       background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
       transition: width 0.3s;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      color: white;
-      font-weight: bold;
-      font-size: 14px;
     }
 
     .progress-info {
@@ -1178,13 +1335,13 @@ async function serveUploadPage() {
     }
 
     .progress-phase .spinner {
+      display: inline-block;
       animation: spinner-rotate 1s linear infinite;
     }
 
     @keyframes spinner-rotate {
-      0% { opacity: 0.3; }
-      50% { opacity: 1; }
-      100% { opacity: 0.3; }
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
     }
 
     .progress-details {
@@ -1219,6 +1376,90 @@ async function serveUploadPage() {
       background: #f8d7da;
       border: 1px solid #f5c6cb;
       color: #721c24;
+    }
+
+    .url-container {
+      margin-top: 15px;
+      padding: 12px;
+      background: #f8f9ff;
+      border-radius: 8px;
+    }
+
+    .url-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 15px;
+    }
+
+    .url-text {
+      flex: 1;
+      font-family: 'Monaco', 'Courier New', monospace;
+      font-size: 13px;
+      color: #667eea;
+      word-break: break-all;
+      padding: 8px;
+      background: white;
+      border-radius: 4px;
+    }
+
+    .copy-btn {
+      flex-shrink: 0;
+      padding: 8px 12px;
+      background: #667eea;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      transition: all 0.2s;
+      white-space: nowrap;
+    }
+
+    .copy-btn:hover {
+      background: #5568d3;
+    }
+
+    .copy-btn.copied {
+      background: #28a745;
+    }
+
+    .password-reminder {
+      padding: 10px;
+      background: #fff3cd;
+      border: 2px solid #ffc107;
+      border-radius: 6px;
+      text-align: center;
+      font-size: 14px;
+      color: #856404;
+    }
+
+    .password-value {
+      font-size: 24px;
+      font-weight: bold;
+      color: #d63384;
+      font-family: 'Monaco', 'Courier New', monospace;
+      margin: 5px 0;
+      letter-spacing: 2px;
+    }
+
+    .btn-next-upload {
+      width: 100%;
+      padding: 12px;
+      margin-top: 15px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 16px;
+      font-weight: 500;
+      transition: all 0.3s;
+    }
+
+    .btn-next-upload:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
     }
 
     .download-link {
@@ -1352,12 +1593,13 @@ async function serveUploadPage() {
     let uploadId = null;
     let statusPollInterval = null;
     let uploadAborted = false;
+    let currentPassword = '';  // 保存当前上传的密码
 
-    // R2分块配置
-    const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB
-    const MAX_CONCURRENT = 4; // 最大并发上传数（从8降到4，提高稳定性）
-    const MAX_RETRY_ATTEMPTS = 5; // 最大重试次数（增加到5次）
-    const RETRY_DELAY_BASE = 1000; // 基础重试延迟(ms)
+    // 配置常量 - 从后端同步
+    const CHUNK_SIZE = ${CONFIG.CHUNK_SIZE};
+    const MAX_CONCURRENT = ${CONFIG.MAX_CONCURRENT};
+    const MAX_RETRY_ATTEMPTS = ${CONFIG.MAX_RETRY_ATTEMPTS};
+    const RETRY_DELAY_BASE = ${CONFIG.RETRY_DELAY_BASE};
 
     /**
      * 判断错误是否可重试
@@ -1556,8 +1798,8 @@ async function serveUploadPage() {
     // 更新进度条
     function updateProgress(percent, phase, details = '', speed = '', time = '') {
       progressBar.style.width = percent + '%';
-      progressBar.textContent = Math.round(percent) + '%';
-      progressPhase.textContent = phase;
+      progressBar.textContent = '';  // 确保进度条内部不显示任何文本
+      progressPhase.innerHTML = phase;  // 使用innerHTML以支持HTML标签
       progressDetails.textContent = details;
       progressDetails.style.color = ''; // 重置颜色（恢复默认）
       progressSpeed.textContent = speed;
@@ -1580,7 +1822,12 @@ async function serveUploadPage() {
       cancelBtn.classList.remove('show');
       uploadArea.style.display = '';
       selectedFiles.style.display = '';
-      regenerateBtn.style.display = '';
+
+      // 恢复密码输入和重新生成按钮
+      passwordInput.disabled = false;
+      regenerateBtn.disabled = false;
+      regenerateBtn.style.opacity = '1';
+      regenerateBtn.style.cursor = 'pointer';
     }
 
     // 完成上传
@@ -1593,12 +1840,63 @@ async function serveUploadPage() {
     // 显示成功结果
     function showSuccessResult(data) {
       const downloadUrl = data.downloadUrl || \`/d/\${data.fileId}\`;
+      const fullUrl = window.location.origin + downloadUrl;
+
       showResult(\`
-        <strong>上传成功！</strong><br>
-        文件ID: \${data.fileId}<br>
-        <a href="\${downloadUrl}" class="download-link" target="_blank">前往下载页面</a>
+        <div class="password-reminder">
+          <div>⚠️ 下载时需要输入下面的密码</div>
+          <div class="password-value">\${currentPassword}</div>
+          <div style="font-size: 12px; color: #856404; margin-top: 5px;">请妥善保管此密码</div>
+        </div>
+        <div class="url-container">
+          <div class="url-row">
+            <div class="url-text">\${fullUrl}</div>
+            <button class="copy-btn" onclick="copyToClipboard('\${fullUrl}', this)">
+              📋 复制下载地址
+            </button>
+          </div>
+        </div>
+        <button class="btn-next-upload" onclick="location.reload()">
+          📤 继续上传其他文件
+        </button>
       \`, 'success');
     }
+
+    // 复制到剪贴板
+    window.copyToClipboard = async function(text, button) {
+      try {
+        await navigator.clipboard.writeText(text);
+        const originalText = button.textContent;
+        button.textContent = '✓ 已复制';
+        button.classList.add('copied');
+
+        setTimeout(() => {
+          button.textContent = originalText;
+          button.classList.remove('copied');
+        }, 2000);
+      } catch (err) {
+        console.error('复制失败:', err);
+        // 降级方案
+        const textArea = document.createElement('textarea');
+        textArea.value = text;
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-999999px';
+        document.body.appendChild(textArea);
+        textArea.select();
+        try {
+          document.execCommand('copy');
+          button.textContent = '✓ 已复制';
+          button.classList.add('copied');
+          setTimeout(() => {
+            button.textContent = '📋 复制';
+            button.classList.remove('copied');
+          }, 2000);
+        } catch (err2) {
+          alert('复制失败，请手动复制');
+        }
+        document.body.removeChild(textArea);
+      }
+    };
 
     // 上传表单提交
     uploadForm.addEventListener('submit', async (e) => {
@@ -1617,6 +1915,9 @@ async function serveUploadPage() {
         return;
       }
 
+      // 保存密码用于成功后显示
+      currentPassword = password;
+
       // 开始上传
       isUploading = true;
       uploadAborted = false;
@@ -1626,10 +1927,15 @@ async function serveUploadPage() {
       cancelBtn.classList.add('show');
       result.classList.remove('show');
 
-      // 隐藏上传区域、已选文件列表和重新生成按钮
+      // 隐藏上传区域、已选文件列表
       uploadArea.style.display = 'none';
       selectedFiles.style.display = 'none';
-      regenerateBtn.style.display = 'none';
+
+      // 禁用密码输入和重新生成按钮
+      passwordInput.disabled = true;
+      regenerateBtn.disabled = true;
+      regenerateBtn.style.opacity = '0.5';
+      regenerateBtn.style.cursor = 'not-allowed';
 
       // 显示初始进度
       if (isSingleZip) {
@@ -1703,18 +2009,17 @@ async function serveUploadPage() {
         const fileUpload = fileUploads[i];
         const totalChunks = fileUpload.totalChunks;
 
-        // 分块上传当前文件
-        const chunks = [];
+        // 🔧 修复：不再预先切片所有chunks，而是在上传时即时切片
+        // 原因：预先切片会创建多个Blob引用，可能导致内存问题或文件句柄问题
+        // 改为只存储chunk索引，在上传时再切片
+        const chunkIndices = [];
         for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-          const start = chunkIndex * CHUNK_SIZE;
-          const end = Math.min(start + CHUNK_SIZE, file.size);
-          const chunk = file.slice(start, end);
-          chunks.push({ chunkIndex, chunk, size: end - start });
+          chunkIndices.push(chunkIndex);
         }
 
         // 并发上传分块
         let uploadedChunks = 0;
-        const uploadQueue = [...chunks];
+        const uploadQueue = [...chunkIndices];
 
         const uploadWorkers = [];
         for (let w = 0; w < MAX_CONCURRENT; w++) {
@@ -1722,14 +2027,20 @@ async function serveUploadPage() {
             while (uploadQueue.length > 0) {
               if (uploadAborted) return;
 
-              const chunkInfo = uploadQueue.shift();
-              if (!chunkInfo) break;
+              const chunkIndex = uploadQueue.shift();
+              if (chunkIndex === undefined) break;
+
+              // 在上传前立即切片，避免持有多个Blob引用
+              const start = chunkIndex * CHUNK_SIZE;
+              const end = Math.min(start + CHUNK_SIZE, file.size);
+              const chunk = file.slice(start, end);
+              const chunkSize = end - start;
 
               const formData = new FormData();
               formData.append('uploadId', uploadId);
               formData.append('fileName', file.name);
-              formData.append('chunkIndex', chunkInfo.chunkIndex);
-              formData.append('chunk', chunkInfo.chunk);
+              formData.append('chunkIndex', chunkIndex);
+              formData.append('chunk', chunk);
 
               // 使用重试机制上传分块
               const chunkData = await retryWithBackoff(
@@ -1740,7 +2051,7 @@ async function serveUploadPage() {
                   });
 
                   if (!chunkResponse.ok) {
-                    const error = new Error(\`分块上传失败: \${file.name} - chunk \${chunkInfo.chunkIndex}\`);
+                    const error = new Error(\`分块上传失败: \${file.name} - chunk \${chunkIndex}\`);
                     error.response = chunkResponse;
                     throw error;
                   }
@@ -1755,11 +2066,11 @@ async function serveUploadPage() {
                   return data;
                 },
                 MAX_RETRY_ATTEMPTS,
-                \`Upload chunk \${chunkInfo.chunkIndex + 1} of \${file.name}\`
+                \`Upload chunk \${chunkIndex + 1} of \${file.name}\`
               );
 
               uploadedChunks++;
-              uploadedBytes += chunkInfo.size;
+              uploadedBytes += chunkSize;
 
               // 更新进度
               const elapsed = (Date.now() - startTime) / 1000;
@@ -1820,7 +2131,7 @@ async function serveUploadPage() {
 
     // 轮询上传/压缩状态
     async function pollUploadStatus() {
-      updateProgress(90, '🔄 压缩中（第2阶段，共2阶段）', '正在服务器端打包文件，可能需要几分钟，请耐心等待...', '', '');
+      updateProgress(90, '<span class="spinner">⏳</span> 压缩中（第2阶段，共2阶段）', '正在服务器端打包文件，可能需要几分钟，请耐心等待...', '', '');
 
       statusPollInterval = setInterval(async () => {
         if (uploadAborted) {
@@ -1834,23 +2145,22 @@ async function serveUploadPage() {
 
           if (data.status === 'completed') {
             clearInterval(statusPollInterval);
-            updateProgress(100, '压缩完成！', '', '', '');
+            updateProgress(100, '✓ 压缩完成！', '', '', '');
 
             setTimeout(() => {
               showSuccessResult(data);
               finishUpload();
             }, 500);
           } else if (data.status === 'failed') {
+            // 🔧 修复：直接在这里处理失败状态，而不是throw error
+            // 因为在setInterval回调中throw error不会被外层catch捕获
             clearInterval(statusPollInterval);
-            throw new Error(data.error || '压缩失败');
+            console.error('Compression failed:', data.error);
+            showResult('压缩失败: ' + (data.error || '未知错误'), 'error');
+            resetUpload();
           } else {
             // 压缩中，更新进度
             const compressPercent = 90 + (data.progress || 0) * 0.1; // 90%-100%
-
-            // 动态转圈符号
-            const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            const spinnerIndex = Math.floor(Date.now() / 100) % spinnerFrames.length;
-            const spinner = spinnerFrames[spinnerIndex];
 
             let details = '';
             if (data.currentFile) {
@@ -1861,7 +2171,7 @@ async function serveUploadPage() {
 
             updateProgress(
               compressPercent,
-              \`\${spinner} 压缩中（第2阶段，共2阶段）\`,
+              '<span class="spinner">⏳</span> 压缩中（第2阶段，共2阶段）',
               details,
               '',
               '大文件压缩需要时间，请勿关闭页面'
@@ -1870,7 +2180,9 @@ async function serveUploadPage() {
         } catch (error) {
           clearInterval(statusPollInterval);
           if (!uploadAborted) {
-            throw error;
+            console.error('Status polling error:', error);
+            showResult('查询状态失败: ' + error.message, 'error');
+            resetUpload();
           }
         }
       }, 1000); // 每秒轮询

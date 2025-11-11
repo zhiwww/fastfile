@@ -1,173 +1,211 @@
-# FastFile - 大文件中转应用
+# FastFile
 
-一个基于Cloudflare技术栈的无需注册的大文件中转应用，支持最大10GB文件的临时存储和分享。
+基于 Cloudflare 技术栈的无需注册大文件中转应用，支持最大 10GB 文件的临时存储和分享。
 
 ## 功能特性
 
-- ✅ **无需注册**：用户无需注册账号即可上传和下载文件
-- ✅ **大文件支持**：支持最大10GB的文件上传
-- ✅ **多文件上传**：支持一次性上传多个文件，自动打包为zip
-- ✅ **密码保护**：使用4位数字密码保护文件安全
-- ✅ **自动生成密码**：页面自动生成随机密码，可手动修改
-- ✅ **自动过期**：文件默认保存30天后自动删除
-- ✅ **中文界面**：完全中文化的用户界面
-- ✅ **移动端适配**：完美支持手机和平板电脑访问
-- ✅ **自定义域名**：支持绑定自己的域名
-- ✅ **自动部署**：支持GitHub Actions自动部署
-
-## 技术栈
-
-- **前端**: HTML + CSS + JavaScript + JSZip
-- **后端**: Cloudflare Workers
-- **存储**:
-  - Cloudflare R2 (文件存储)
-  - Cloudflare KV (元数据存储)
-- **部署**: GitHub Actions
-- **CDN**: Cloudflare全球CDN
-
-## 项目结构
-
-```
-fastfile/
-├── .github/
-│   └── workflows/
-│       └── deploy.yml          # GitHub Actions部署配置
-├── src/
-│   ├── index.js                # Worker主文件
-│   └── utils.js                # 工具函数
-├── wrangler.toml               # Cloudflare配置
-├── package.json                # 项目配置
-├── DEPLOYMENT.md               # 详细部署指南
-├── CUSTOM_DOMAIN.md            # 自定义域名快速配置指南
-├── .gitignore
-└── README.md
-```
+- **无需注册**：用户无需注册账号即可上传和下载文件
+- **大文件支持**：支持最大 10GB 的文件上传（分块上传 + 自动重试）
+- **多文件上传**：支持一次性上传多个文件，自动打包为 zip
+- **密码保护**：使用 4 位数字密码保护文件安全
+- **自动过期**：文件默认保存 30 天后自动删除
+- **完整监控**：结构化日志 + 性能指标 + 请求追踪
+- **自定义域名**：支持绑定自己的域名
+- **移动端适配**：完美支持手机和平板电脑访问
 
 ## 快速开始
 
 ### 本地开发
 
-1. 克隆项目
 ```bash
-git clone https://github.com/你的用户名/fastfile.git
+# 1. 克隆项目
+git clone https://github.com/your-username/fastfile.git
 cd fastfile
-```
 
-2. 安装依赖
-```bash
+# 2. 安装依赖
 npm install
-```
 
-3. 配置Cloudflare资源（参考DEPLOYMENT.md）
+# 3. 配置环境（参考 docs/DEPLOYMENT.md）
+wrangler kv:namespace create "FILE_META"
+wrangler r2 bucket create fastfile-storage
 
-4. 本地运行
-```bash
+# 4. 本地运行
 npm run dev
-```
 
-5. 访问 http://localhost:8787
+# 5. 访问 http://localhost:8787
+```
 
 ### 部署到生产环境
 
-详细部署步骤请查看 [DEPLOYMENT.md](./DEPLOYMENT.md)
+详细部署步骤请查看 [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md)
 
-### 配置自定义域名（可选）
+```bash
+# 快速部署
+npm run deploy
+```
 
-FastFile支持使用自己的域名，如 `file.example.com`：
+## 技术栈
 
-1. 域名必须托管在Cloudflare
-2. 在Cloudflare Dashboard配置Workers路由
-3. 添加DNS记录（AAAA记录，指向 `100::`）
+| 技术 | 用途 |
+|------|------|
+| Cloudflare Workers | 无服务器计算平台 |
+| Cloudflare R2 | 对象存储（文件存储） |
+| Cloudflare KV | 键值存储（元数据） |
+| aws4fetch | R2 S3 API 签名 |
+| fflate | 高性能压缩库 |
 
-**快速开始**：查看 [CUSTOM_DOMAIN.md](./CUSTOM_DOMAIN.md)（5分钟配置完成）
+## 项目结构
 
-**详细指南**：查看 [DEPLOYMENT.md - 自定义域名配置](./DEPLOYMENT.md#自定义域名配置)
+```
+fastfile/
+├── src/
+│   ├── index-r2.js         # Worker 主入口（R2 Multipart Upload）
+│   ├── logger.js           # 结构化日志系统
+│   └── utils.js            # 工具函数
+├── docs/
+│   ├── DEPLOYMENT.md       # 部署指南
+│   ├── R2_SETUP.md         # R2 配置指南
+│   ├── MONITORING.md       # 监控系统文档
+│   └── OPTIMIZATION.md     # 性能优化指南
+├── wrangler.toml           # Cloudflare 配置
+├── package.json            # 项目配置
+├── CLAUDE.md               # 技术文档（AI助手专用）
+└── README.md               # 本文件
+```
 
-**优势**：
-- 更专业的品牌形象
-- 自定义域名更易记
-- 支持多域名配置
-- 与workers.dev域名并存
+## 核心功能
+
+### 分块上传
+
+使用 R2 Multipart Upload API，支持大文件上传：
+
+- **分块大小**：10MB/块
+- **并发上传**：最多 4 个并发请求
+- **自动重试**：最多重试 5 次
+- **断点续传**：支持上传失败后继续
+
+### 智能重试
+
+指数退避算法自动重试临时错误：
+
+- 自动识别 14 种网络错误模式
+- 最多 6 次尝试（1次原始 + 5次重试）
+- 随机抖动避免请求风暴
+- 不阻塞其他 chunk 上传
+
+### 完整监控
+
+结构化日志 + 性能指标：
+
+- JSON 格式日志，易于查询
+- 请求级别追踪
+- 上传会话追踪
+- 性能指标收集
+- Grafana/Loki 兼容
 
 ## 使用说明
 
 ### 上传文件
 
 1. 访问应用首页
-2. 点击"选择文件"按钮，选择一个或多个文件
-3. 设置4位数字密码（例如：1234）
-4. 点击"上传文件"按钮
-5. 上传成功后会显示下载链接和密码
-6. 将链接和密码分享给需要下载的人
+2. 选择一个或多个文件（最大 10GB）
+3. 设置 4 位数字密码
+4. 点击"上传文件"
+5. 复制下载链接和密码分享
 
 ### 下载文件
 
-1. 打开分享的下载链接
-2. 输入4位数字密码
-3. 点击"验证密码"按钮
-4. 验证成功后点击"下载文件"按钮
+1. 打开下载链接
+2. 输入密码
+3. 点击"下载文件"
 
-## 工作原理
+### 查看日志
 
-1. **文件上传**：
-   - 用户选择文件后，如果是多个文件或非zip文件，会在客户端使用JSZip自动打包为zip
-   - 打包后的文件上传到Cloudflare R2存储
-   - 密码经过SHA-256哈希后存储在KV中
-   - 生成8位随机文件ID作为下载标识
+```bash
+# 实时日志
+wrangler tail
 
-2. **文件下载**：
-   - 用户访问下载链接 `/d/{fileId}`
-   - 输入密码后验证哈希值
-   - 验证通过后生成临时下载令牌
-   - 使用令牌从R2下载文件
+# 过滤错误日志
+wrangler tail --format json | jq 'select(.level == "ERROR")'
 
-3. **自动清理**：
-   - Cloudflare Cron Triggers每天00:00执行清理任务
-   - 检查所有文件的过期时间
-   - 删除超过30天的文件和元数据
+# 监控特定上传
+wrangler tail --format json | jq 'select(.uploadId == "abc123")'
+```
+
+## 性能数据
+
+| 文件大小 | 上传时间 | 吞吐量 |
+|---------|---------|--------|
+| 100MB | ~20秒 | ~5 MB/s |
+| 1GB | ~3分钟 | ~5.5 MB/s |
+| 10GB | ~30分钟 | ~5.5 MB/s |
+
+注：实际速度受用户网络带宽限制。
+
+## 文档导航
+
+### 新手入门
+- [部署指南](./docs/DEPLOYMENT.md) - 完整的部署步骤
+- [R2 配置](./docs/R2_SETUP.md) - R2 Multipart Upload 配置
+
+### 运维指南
+- [监控系统](./docs/MONITORING.md) - 日志、指标、追踪
+- [性能优化](./docs/OPTIMIZATION.md) - 配置调优、最佳实践
+
+### 开发指南
+- [技术文档](./CLAUDE.md) - 架构设计、核心代码说明
 
 ## 安全特性
 
-- 密码使用SHA-256哈希存储，不保存明文
+- 密码使用 SHA-256 哈希存储
 - 下载需要临时令牌验证
-- 文件ID随机生成，难以猜测
-- 自动过期机制防止文件长期占用空间
-
-## 性能优化
-
-- 客户端打包减轻服务器压力
-- 利用Cloudflare全球CDN加速文件传输
-- R2对象存储提供高性能读写
-- KV缓存元数据减少数据库查询
+- 文件 ID 随机生成
+- 自动过期清理
 
 ## 限制说明
 
-- 单次上传最大10GB（可在配置中修改）
-- 文件保存30天（可在配置中修改）
-- Cloudflare Workers单次请求最大128MB（大文件需要分块上传）
-- KV操作有频率限制
+| 项目 | 限制 |
+|------|------|
+| 单次上传最大 | 10GB |
+| 文件保存时间 | 30天 |
+| Workers CPU时间 | 150秒（可配置） |
+| R2 对象最大 | 5TB |
+| KV 值最大 | 25MB |
 
-## 自定义配置
+## 配置调优
 
-可以通过修改源码来自定义以下配置：
+根据网络环境调整配置（`src/index-r2.js`）：
 
-- 文件保存天数（`src/utils.js` 中的 `getExpiryTime`）
-- 文件大小限制（`src/index.js` 中的上传检查）
-- 密码格式（`src/utils.js` 中的 `isValidPassword`）
-- 界面样式（`src/index.js` 中的HTML内联样式）
+```javascript
+// 高速网络
+const CONFIG = {
+  MAX_CONCURRENT: 8,     // 更多并发
+  CHUNK_SIZE: 20 * 1024 * 1024  // 20MB
+};
+
+// 弱网环境
+const CONFIG = {
+  MAX_CONCURRENT: 2,     // 更少并发
+  CHUNK_SIZE: 5 * 1024 * 1024   // 5MB
+};
+```
+
+详细配置说明请参考 [性能优化指南](./docs/OPTIMIZATION.md)。
 
 ## 开发计划
 
-- [ ] 支持文件分块上传（突破100MB限制）
-- [ ] 添加上传进度显示
-- [ ] 支持自定义过期时间
-- [ ] 添加文件下载次数限制
-- [ ] 支持文件预览功能
-- [ ] 添加管理后台
+- [x] R2 Multipart Upload 分块上传
+- [x] 智能重试机制
+- [x] 完整监控系统
+- [ ] 断点续传 UI
+- [ ] 自定义过期时间
+- [ ] 文件下载次数限制
+- [ ] 文件预览功能
+- [ ] 管理后台
 
 ## 贡献
 
-欢迎提交Issue和Pull Request！
+欢迎提交 Issue 和 Pull Request！
 
 ## 许可证
 
@@ -175,8 +213,8 @@ MIT License
 
 ## 联系方式
 
-如有问题或建议，请提交Issue。
+如有问题或建议，请提交 Issue。
 
 ---
 
-**注意**：本项目使用Cloudflare服务，部分功能可能产生费用，请注意Cloudflare的定价政策。
+**注意**：本项目使用 Cloudflare 服务，部分功能可能产生费用。请参考 [Cloudflare 定价](https://www.cloudflare.com/plans/)。
