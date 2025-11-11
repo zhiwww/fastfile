@@ -1,0 +1,17 @@
+name = "fastfile"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# KV命名空间用于存储文件元数据
+[[kv_namespaces]]
+binding = "FILE_META"
+id = "YOUR_KV_NAMESPACE_ID"  # 部署时需要替换
+
+# R2存储桶用于存储文件
+[[r2_buckets]]
+binding = "FILE_STORAGE"
+bucket_name = "fastfile-storage"  # 部署时需要创建
+
+# 定时任务用于清理过期文件
+[triggers]
+crons = ["0 0 * * *"]  # 每天00:00执行清理任务
