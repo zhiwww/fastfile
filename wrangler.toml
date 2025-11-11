@@ -5,13 +5,25 @@ compatibility_date = "2024-01-01"
 # KV命名空间用于存储文件元数据
 [[kv_namespaces]]
 binding = "FILE_META"
-id = "YOUR_KV_NAMESPACE_ID"  # 部署时需要替换
+id = "eebe6705cd794ffea868aeea3954658c"
 
 # R2存储桶用于存储文件
 [[r2_buckets]]
 binding = "FILE_STORAGE"
-bucket_name = "fastfile-storage"  # 部署时需要创建
+bucket_name = "fastfile-storage"
 
 # 定时任务用于清理过期文件
 [triggers]
 crons = ["0 0 * * *"]  # 每天00:00执行清理任务
+
+# 自定义域名配置（可选）
+# 取消注释以下配置来启用自定义域名
+routes = [
+  { pattern = "file.zwi.monster/*", zone_name = "zwi.monster" }
+]
+
+# 或者使用 custom_domain（推荐，更简单）
+# [env.production]
+# route = "file.example.com/*"
+# zone_name = "example.com"
+

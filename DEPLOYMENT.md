@@ -93,6 +93,131 @@ git push -u origin main
 
 部署成功后，访问Cloudflare Workers提供的URL（格式：`https://fastfile.你的账号.workers.dev`）来验证应用是否正常运行。
 
+## 自定义域名配置
+
+如果你想使用自己的域名（如 `file.example.com`）而不是默认的 `workers.dev` 域名，可以按照以下步骤配置。
+
+### 前提条件
+
+1. 域名必须托管在Cloudflare DNS
+2. 域名已添加到你的Cloudflare账户
+3. SSL/TLS加密模式设置为"Full"或"Full (strict)"
+
+### 方法一：通过Cloudflare Dashboard配置（推荐）
+
+这是最简单的方法，适合新手：
+
+1. **登录Cloudflare Dashboard**
+   - 访问 https://dash.cloudflare.com
+   - 选择你的域名
+
+2. **添加Workers路由**
+   - 进入 Workers Routes
+   - 点击"Add route"
+   - Route: `file.example.com/*` （替换为你的子域名）
+   - Service: 选择 `fastfile`
+   - Environment: production
+   - 点击"Save"
+
+3. **配置DNS记录**
+   - 进入 DNS 设置
+   - 添加一条记录：
+     - Type: `AAAA`
+     - Name: `file` （或你的子域名）
+     - IPv6 address: `100::`
+     - Proxy status: `Proxied` (橙色云朵图标)
+   - 点击"Save"
+
+4. **等待生效**
+   - DNS记录通常几分钟内生效
+   - 访问 `https://file.example.com` 测试
+
+### 方法二：通过wrangler.toml配置
+
+这种方法适合通过代码管理配置：
+
+1. **编辑 wrangler.toml**
+
+```toml
+# 使用 routes 配置
+routes = [
+  { pattern = "file.example.com/*", zone_name = "example.com" }
+]
+```
+
+或者使用更简单的方式：
+
+```toml
+# 使用 route 配置（推荐）
+route = "file.example.com/*"
+zone_name = "example.com"
+```
+
+2. **配置DNS记录**
+   - 参考方法一的步骤3
+
+3. **重新部署**
+
+```bash
+npm run deploy
+```
+
+### 方法三：使用Cloudflare Pages域名（可选）
+
+如果你想要更简单的配置，可以使用Cloudflare提供的自定义域名功能：
+
+1. 在Cloudflare Dashboard中
+2. 进入 Workers & Pages
+3. 选择你的Worker
+4. 进入 Settings -> Domains & Routes
+5. 点击"Add Custom Domain"
+6. 输入你的域名（如 `file.example.com`）
+7. Cloudflare会自动配置DNS和SSL
+
+### 多域名支持
+
+如果你想支持多个域名，可以在 `wrangler.toml` 中配置多个路由：
+
+```toml
+routes = [
+  { pattern = "file.example.com/*", zone_name = "example.com" },
+  { pattern = "share.example.com/*", zone_name = "example.com" },
+  { pattern = "transfer.anotherdomain.com/*", zone_name = "anotherdomain.com" }
+]
+```
+
+### 验证自定义域名
+
+配置完成后，访问你的自定义域名：
+
+```bash
+# 测试访问
+curl https://file.example.com
+
+# 或在浏览器中打开
+https://file.example.com
+```
+
+### 常见问题
+
+**Q: 配置后无法访问？**
+- 检查DNS记录是否正确配置
+- 确保Proxy状态为"Proxied"（橙色云朵）
+- 等待几分钟让DNS生效
+- 检查SSL/TLS模式是否为"Full"或"Full (strict)"
+
+**Q: 显示SSL错误？**
+- 确保SSL/TLS加密模式正确
+- 在Cloudflare Dashboard中强制HTTPS重定向
+
+**Q: Workers.dev域名还能用吗？**
+- 可以！配置自定义域名后，workers.dev域名仍然可用
+- 你可以同时使用两个域名
+
+**Q: 需要修改代码吗？**
+- 不需要！应用会自动适配任何域名
+- 下载链接会根据访问的域名自动生成
+
 ## 功能说明
 
 ### 文件上传

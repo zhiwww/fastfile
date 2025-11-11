@@ -8,8 +8,11 @@
 - ✅ **大文件支持**：支持最大10GB的文件上传
 - ✅ **多文件上传**：支持一次性上传多个文件，自动打包为zip
 - ✅ **密码保护**：使用4位数字密码保护文件安全
+- ✅ **自动生成密码**：页面自动生成随机密码，可手动修改
 - ✅ **自动过期**：文件默认保存30天后自动删除
 - ✅ **中文界面**：完全中文化的用户界面
+- ✅ **移动端适配**：完美支持手机和平板电脑访问
+- ✅ **自定义域名**：支持绑定自己的域名
 - ✅ **自动部署**：支持GitHub Actions自动部署
 
 ## 技术栈
@@ -34,7 +37,8 @@ fastfile/
 │   └── utils.js                # 工具函数
 ├── wrangler.toml               # Cloudflare配置
 ├── package.json                # 项目配置
-├── DEPLOYMENT.md               # 部署指南
+├── DEPLOYMENT.md               # 详细部署指南
+├── CUSTOM_DOMAIN.md            # 自定义域名快速配置指南
 ├── .gitignore
 └── README.md
 ```
@@ -66,6 +70,24 @@ npm run dev
 ### 部署到生产环境
 
 详细部署步骤请查看 [DEPLOYMENT.md](./DEPLOYMENT.md)
+
+### 配置自定义域名（可选）
+
+FastFile支持使用自己的域名，如 `file.example.com`：
+
+1. 域名必须托管在Cloudflare
+2. 在Cloudflare Dashboard配置Workers路由
+3. 添加DNS记录（AAAA记录，指向 `100::`）
+
+**快速开始**：查看 [CUSTOM_DOMAIN.md](./CUSTOM_DOMAIN.md)（5分钟配置完成）
+
+**详细指南**：查看 [DEPLOYMENT.md - 自定义域名配置](./DEPLOYMENT.md#自定义域名配置)
+
+**优势**：
+- 更专业的品牌形象
+- 自定义域名更易记
+- 支持多域名配置
+- 与workers.dev域名并存
 
 ## 使用说明
 

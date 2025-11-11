@@ -171,12 +171,15 @@ async function handleVerify(request, env) {
       return errorResponse('密码错误', 401);
     }
 
+    // 使用哈希后的密码生成令牌，这样下载时也能验证
+    const downloadToken = await generateDownloadToken(fileId, metadata.password);
+
     return jsonResponse({
       success: true,
       fileId,
       fileName: metadata.fileName,
       fileSize: metadata.fileSize,
-      downloadUrl: `/api/download/${fileId}?token=${await generateDownloadToken(fileId, password)}`,
+      downloadUrl: `/api/download/${fileId}?token=${downloadToken}`,
     });
 
   } catch (error) {
@@ -212,9 +215,9 @@ async function handleDownload(fileId, request, env) {
       return errorResponse('文件已过期', 410);
     }
 
-    // 验证下载令牌（简化版本）
+    // 验证下载令牌
     const expectedToken = await generateDownloadToken(fileId, metadata.password);
-    if (token !== expectedToken.substring(0, 16)) {
+    if (token !== expectedToken) {
       return errorResponse('无效的下载令牌', 401);
     }
 
@@ -304,23 +307,67 @@ async function serveUploadPage() {
   <title>FastFile - 大文件中转</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; padding: 20px; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; padding: 20px; min-height: 100vh; }
     .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; padding: 40px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-    h1 { color: #333; margin-bottom: 30px; text-align: center; }
+    h1 { color: #333; margin-bottom: 30px; text-align: center; font-size: 28px; }
     .form-group { margin-bottom: 20px; }
-    label { display: block; margin-bottom: 8px; color: #555; font-weight: 500; }
-    input[type="file"] { width: 100%; padding: 10px; border: 2px dashed #ddd; border-radius: 8px; cursor: pointer; }
-    input[type="text"] { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 16px; }
-    button { width: 100%; padding: 14px; background: #007bff; color: white; border: none; border-radius: 8px; font-size: 16px; cursor: pointer; transition: background 0.3s; }
+    label { display: block; margin-bottom: 8px; color: #555; font-weight: 500; font-size: 15px; }
+    input[type="file"] { width: 100%; padding: 12px; border: 2px dashed #ddd; border-radius: 8px; cursor: pointer; font-size: 14px; }
+    input[type="file"]::-webkit-file-upload-button { padding: 8px 16px; border: none; background: #007bff; color: white; border-radius: 6px; cursor: pointer; font-size: 14px; }
+    .password-group { display: flex; gap: 10px; align-items: center; }
+    input[type="text"] { flex: 1; padding: 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 18px; letter-spacing: 2px; text-align: center; font-weight: bold; min-height: 48px; }
+    input[type="text"]:focus { outline: none; border-color: #007bff; box-shadow: 0 0 0 3px rgba(0,123,255,0.1); }
+    .generate-btn { padding: 14px 20px; background: #28a745; color: white; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; transition: background 0.3s; white-space: nowrap; min-height: 48px; }
+    .generate-btn:hover { background: #218838; }
+    .generate-btn:active { transform: scale(0.98); }
+    button { width: 100%; padding: 16px; background: #007bff; color: white; border: none; border-radius: 8px; font-size: 16px; cursor: pointer; transition: background 0.3s; min-height: 48px; font-weight: 500; }
     button:hover { background: #0056b3; }
+    button:active { transform: scale(0.98); }
     button:disabled { background: #ccc; cursor: not-allowed; }
-    .message { margin-top: 20px; padding: 12px; border-radius: 8px; display: none; }
+    small { font-size: 13px; line-height: 1.4; }
+    .message { margin-top: 20px; padding: 16px; border-radius: 8px; display: none; line-height: 1.6; font-size: 14px; }
     .message.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
     .message.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
     .download-link { margin-top: 10px; word-break: break-all; }
+    .download-link a { color: #007bff; text-decoration: none; }
     .progress { margin-top: 20px; display: none; }
-    .progress-bar { width: 100%; height: 30px; background: #f0f0f0; border-radius: 15px; overflow: hidden; }
-    .progress-fill { height: 100%; background: #007bff; transition: width 0.3s; text-align: center; color: white; line-height: 30px; }
+    .progress-bar { width: 100%; height: 36px; background: #f0f0f0; border-radius: 18px; overflow: hidden; }
+    .progress-fill { height: 100%; background: #007bff; transition: width 0.3s; text-align: center; color: white; line-height: 36px; font-weight: 500; }
+
+    /* 平板电脑适配 */
+    @media (max-width: 768px) {
+      body { padding: 15px; }
+      .container { padding: 30px 25px; }
+      h1 { font-size: 24px; margin-bottom: 25px; }
+      label { font-size: 14px; }
+    }
+
+    /* 手机适配 */
+    @media (max-width: 480px) {
+      body { padding: 10px; }
+      .container { padding: 20px 15px; border-radius: 8px; }
+      h1 { font-size: 20px; margin-bottom: 20px; }
+      .form-group { margin-bottom: 16px; }
+      label { font-size: 13px; margin-bottom: 6px; }
+      input[type="file"] { padding: 10px; font-size: 13px; }
+      input[type="file"]::-webkit-file-upload-button { padding: 6px 12px; font-size: 13px; }
+      .password-group { gap: 8px; }
+      input[type="text"] { padding: 12px 8px; font-size: 16px; letter-spacing: 1px; min-height: 44px; }
+      .generate-btn { padding: 12px 12px; font-size: 13px; min-height: 44px; }
+      button { padding: 14px; font-size: 15px; min-height: 44px; }
+      small { font-size: 12px; }
+      .message { padding: 12px; font-size: 13px; }
+      .progress-bar { height: 32px; }
+      .progress-fill { line-height: 32px; font-size: 13px; }
+    }
+
+    /* 小屏幕手机适配 */
+    @media (max-width: 360px) {
+      .container { padding: 15px 10px; }
+      h1 { font-size: 18px; }
+      .password-group { flex-direction: column; gap: 8px; }
+      .generate-btn { width: 100%; }
+    }
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 </head>
@@ -335,8 +382,12 @@ async function serveUploadPage() {
       </div>
 
       <div class="form-group">
-        <label for="password">设置4位数字密码</label>
-        <input type="text" id="password" name="password" placeholder="例如: 1234" maxlength="4" pattern="\\d{4}" required>
+        <label for="password">4位数字密码（已自动生成）</label>
+        <div class="password-group">
+          <input type="text" id="password" name="password" placeholder="****" maxlength="4" pattern="\\d{4}" required>
+          <button type="button" class="generate-btn" id="generateBtn">重新生成</button>
+        </div>
+        <small style="color: #666; margin-top: 5px; display: block;">⚠️ 请务必记录此密码，下载时需要使用（可手动修改）</small>
       </div>
 
       <button type="submit" id="submitBtn">上传文件</button>
@@ -358,6 +409,30 @@ async function serveUploadPage() {
     const message = document.getElementById('message');
     const progress = document.getElementById('progress');
     const progressFill = document.getElementById('progressFill');
+    const passwordInput = document.getElementById('password');
+    const generateBtn = document.getElementById('generateBtn');
+
+    // 生成4位随机数字密码
+    function generatePassword() {
+      const password = Math.floor(1000 + Math.random() * 9000).toString();
+      passwordInput.value = password;
+      // 短暂高亮提示
+      passwordInput.style.background = '#fffacd';
+      setTimeout(() => {
+        passwordInput.style.background = 'white';
+      }, 500);
+    }
+
+    // 页面加载时自动生成密码
+    generatePassword();
+
+    // 点击按钮重新生成密码
+    generateBtn.addEventListener('click', generatePassword);
+
+    // 点击密码输入框时自动全选，方便复制
+    passwordInput.addEventListener('click', function() {
+      this.select();
+    });
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -445,10 +520,12 @@ async function serveUploadPage() {
           updateProgress(100);
           const downloadUrl = window.location.origin + result.downloadUrl;
           showMessage(
-            \`上传成功！<br><br>下载链接：<div class="download-link"><a href="\${downloadUrl}" target="_blank">\${downloadUrl}</a></div><br>密码：\${password}<br><br>链接30天内有效\`,
+            \`✅ 上传成功！<br><br><strong style="color: #d9534f;">⚠️ 请务必记录以下信息：</strong><br><br><strong>下载链接：</strong><div class="download-link"><a href="\${downloadUrl}" target="_blank">\${downloadUrl}</a></div><br><strong style="font-size: 18px; color: #d9534f;">密码：\${password}</strong><br><br>💡 链接30天内有效，请妥善保管密码！\`,
             'success'
           );
           form.reset();
+          // 重新生成新密码供下次使用
+          generatePassword();
         } else {
           showMessage('上传失败: ' + (result.error || '未知错误'), 'error');
         }
@@ -497,21 +574,56 @@ async function serveDownloadPage(fileId, env) {
   <title>下载文件 - FastFile</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; padding: 20px; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; padding: 20px; min-height: 100vh; }
     .container { max-width: 500px; margin: 0 auto; background: white; border-radius: 12px; padding: 40px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-    h1 { color: #333; margin-bottom: 30px; text-align: center; }
+    h1 { color: #333; margin-bottom: 30px; text-align: center; font-size: 26px; }
     .form-group { margin-bottom: 20px; }
-    label { display: block; margin-bottom: 8px; color: #555; font-weight: 500; }
-    input[type="text"] { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 16px; text-align: center; letter-spacing: 8px; }
-    button { width: 100%; padding: 14px; background: #28a745; color: white; border: none; border-radius: 8px; font-size: 16px; cursor: pointer; transition: background 0.3s; }
+    label { display: block; margin-bottom: 10px; color: #555; font-weight: 500; font-size: 15px; }
+    input[type="text"] { width: 100%; padding: 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 20px; text-align: center; letter-spacing: 8px; font-weight: bold; min-height: 48px; }
+    input[type="text"]:focus { outline: none; border-color: #28a745; box-shadow: 0 0 0 3px rgba(40,167,69,0.1); }
+    button { width: 100%; padding: 16px; background: #28a745; color: white; border: none; border-radius: 8px; font-size: 16px; cursor: pointer; transition: background 0.3s; min-height: 48px; font-weight: 500; }
     button:hover { background: #218838; }
+    button:active { transform: scale(0.98); }
     button:disabled { background: #ccc; cursor: not-allowed; }
-    .message { margin-top: 20px; padding: 12px; border-radius: 8px; display: none; }
+    .message { margin-top: 20px; padding: 16px; border-radius: 8px; display: none; line-height: 1.6; font-size: 14px; }
     .message.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-    .file-info { margin-top: 20px; padding: 15px; background: #f8f9fa; border-radius: 8px; display: none; }
-    .file-info p { margin-bottom: 10px; color: #555; }
+    .file-info { margin-top: 20px; padding: 20px; background: #f8f9fa; border-radius: 8px; display: none; }
+    .file-info p { margin-bottom: 12px; color: #555; font-size: 15px; line-height: 1.5; word-break: break-word; }
+    .file-info p strong { color: #333; }
     .download-btn { margin-top: 15px; background: #007bff; }
     .download-btn:hover { background: #0056b3; }
+
+    /* 平板电脑适配 */
+    @media (max-width: 768px) {
+      body { padding: 15px; }
+      .container { padding: 30px 25px; }
+      h1 { font-size: 23px; margin-bottom: 25px; }
+      label { font-size: 14px; }
+      input[type="text"] { font-size: 18px; letter-spacing: 6px; }
+    }
+
+    /* 手机适配 */
+    @media (max-width: 480px) {
+      body { padding: 10px; }
+      .container { padding: 25px 20px; border-radius: 8px; }
+      h1 { font-size: 20px; margin-bottom: 20px; }
+      .form-group { margin-bottom: 16px; }
+      label { font-size: 13px; margin-bottom: 8px; }
+      input[type="text"] { padding: 12px; font-size: 18px; letter-spacing: 5px; min-height: 44px; }
+      button { padding: 14px; font-size: 15px; min-height: 44px; }
+      .message { padding: 12px; font-size: 13px; }
+      .file-info { padding: 15px; }
+      .file-info p { font-size: 14px; margin-bottom: 10px; }
+    }
+
+    /* 小屏幕手机适配 */
+    @media (max-width: 360px) {
+      .container { padding: 20px 15px; }
+      h1 { font-size: 18px; }
+      input[type="text"] { font-size: 16px; letter-spacing: 4px; }
+      .file-info { padding: 12px; }
+      .file-info p { font-size: 13px; }
+    }
   </style>
 </head>
 <body>
@@ -543,6 +655,12 @@ async function serveDownloadPage(fileId, env) {
     const message = document.getElementById('message');
     const fileInfo = document.getElementById('fileInfo');
     const downloadBtn = document.getElementById('downloadBtn');
+    const passwordInput = document.getElementById('password');
+
+    // 点击密码输入框时自动全选，方便粘贴
+    passwordInput.addEventListener('click', function() {
+      this.select();
+    });
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
