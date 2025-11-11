@@ -1,5 +1,5 @@
 name = "fastfile"
-main = "src/index.js"
+main = "src/index-r2.js"
 compatibility_date = "2024-01-01"
 
 # CPU时间限制: 5分钟
@@ -16,18 +16,19 @@ id = "eebe6705cd794ffea868aeea3954658c"
 binding = "FILE_STORAGE"
 bucket_name = "fastfile-storage"
 
+# R2 API凭证 (需要配置secrets)
+# 运行以下命令设置secrets:
+# wrangler secret put R2_ACCOUNT_ID
+# wrangler secret put R2_ACCESS_KEY_ID
+# wrangler secret put R2_SECRET_ACCESS_KEY
+# wrangler secret put R2_BUCKET_NAME
+
 # 定时任务用于清理过期文件
 [triggers]
 crons = ["0 0 * * *"]  # 每天00:00执行清理任务
 
-# 自定义域名配置（可选）
-# 取消注释以下配置来启用自定义域名
+# 自定义域名配置
 routes = [
   { pattern = "file.zwi.monster/*", zone_name = "zwi.monster" }
 ]
-
-# 或者使用 custom_domain（推荐，更简单）
-# [env.production]
-# route = "file.example.com/*"
-# zone_name = "example.com"
 
