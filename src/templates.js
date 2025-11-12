@@ -1097,7 +1097,7 @@ export async function serveUploadPage(CONFIG) {
                       partNumber,
                       etag
                     })
-                  }, 10000); // 10秒超时
+                  }, 60000); // 60秒超时
 
                   if (!confirmResponse.ok) {
                     const error = new Error(\`确认上传失败: \${file.name} - chunk \${chunkIndex}\`);
