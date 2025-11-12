@@ -284,7 +284,7 @@ export async function handleUploadChunk(request, env, logger, metrics, CONFIG, r
  * 此端点非常轻量级，不处理文件数据，只记录 ETag
  */
 export async function handleUploadChunkConfirm(request, env, logger, metrics) {
-  const requestLogger = logger ? logger.child({ handler: 'upload.chunk.confirm' }) : { info: () => {}, warn: () => {}, error: () => {} };
+  const requestLogger = logger ? logger.child({ handler: 'upload.chunk.confirm' }) : { info: () => { }, warn: () => { }, error: () => { } };
   const t0 = Date.now();
 
   try {
@@ -299,14 +299,20 @@ export async function handleUploadChunkConfirm(request, env, logger, metrics) {
       return errorResponse('缺少必要参数', 400);
     }
 
-    // 获取上传元数据
-    const metaStr = await env.FILE_META.get(`upload:${uploadId}`);
+    // ⭐ 并行获取：上传元数据 + 检查是否已存在
+    const chunkKey = `upload:${uploadId}:chunk:${fileName}:${chunkIndex}`;
+
+    const [metaStr, existingChunk] = await Promise.all([
+      env.FILE_META.get(`upload:${uploadId}`),
+      env.FILE_META.get(chunkKey)
+    ]);
+
     if (!metaStr) {
       return errorResponse('上传不存在', 404);
     }
 
     const t2 = Date.now();
-    console.log(`⏱️ [ChunkConfirm] Get upload meta: ${t2 - t1}ms`);
+    console.log(`⏱️ [ChunkConfirm] Get meta (parallel): ${t2 - t1}ms`);
 
     const meta = JSON.parse(metaStr);
     const fileUpload = meta.files.find(f => f.name === fileName);
@@ -315,58 +321,71 @@ export async function handleUploadChunkConfirm(request, env, logger, metrics) {
       return errorResponse('文件不存在', 404);
     }
 
-    // 🔧 保存 chunk 记录到 KV（与原 handleUploadChunk 相同的格式）
-    const chunkKey = `upload:${uploadId}:chunk:${fileName}:${chunkIndex}`;
-    await env.FILE_META.put(chunkKey, JSON.stringify({
+    // ⭐ 准备写入操作
+    const chunkData = {
       partNumber,
       etag,
       fileName,
       chunkIndex,
       uploadedAt: Date.now()
-    }));
+    };
+
+    // ⭐ 更新计数器（只在新增时）
+    const isNewChunk = !existingChunk;
+    let uploadedCount = meta.uploadedCount || 0;
+    let needsMetaUpdate = false;
+
+    if (isNewChunk) {
+      uploadedCount++;
+      meta.uploadedCount = uploadedCount;
+      needsMetaUpdate = true;
+    }
+
+    // ⭐ 并行写入：chunk 数据 + 元数据（如果需要）
+    const writePromises = [
+      env.FILE_META.put(chunkKey, JSON.stringify(chunkData))
+    ];
+
+    if (needsMetaUpdate) {
+      writePromises.push(
+        env.FILE_META.put(`upload:${uploadId}`, JSON.stringify(meta))
+      );
+    }
+
+    await Promise.all(writePromises);
 
     const t3 = Date.now();
-    console.log(`⏱️ [ChunkConfirm] Save chunk meta: ${t3 - t2}ms`);
+    console.log(`⏱️ [ChunkConfirm] Save (parallel writes): ${t3 - t2}ms`);
 
     requestLogger.info('Chunk confirmed', {
       uploadId,
       fileName,
       chunkIndex,
       partNumber,
+      isNewChunk,
+      uploadedCount,
       etag: etag.substring(0, 10) + '...'
     });
 
-    // 计算总体进度（从独立的 chunk 记录中统计）
+    // ⭐ 计算进度 - O(1) 操作
     const totalChunks = meta.files.reduce((sum, f) => sum + f.totalChunks, 0);
-    let uploadedCount = 0;
-
-    // 统计已上传的 chunks
-    for (const file of meta.files) {
-      for (let i = 0; i < file.totalChunks; i++) {
-        const key = `upload:${uploadId}:chunk:${file.name}:${i}`;
-        const exists = await env.FILE_META.get(key);
-        if (exists) uploadedCount++;
-      }
-    }
-
-    const t4 = Date.now();
-    console.log(`⏱️ [ChunkConfirm] Count progress: ${t4 - t3}ms`);
-
     const progress = (uploadedCount / totalChunks) * 100;
 
     const totalDuration = Date.now() - t0;
-    console.log(`⏱️ [ChunkConfirm] Total duration: ${totalDuration}ms (target: <1000ms)`);
+    console.log(`⏱️ [ChunkConfirm] Total: ${totalDuration}ms (optimized, target: <100ms)`);
 
     if (metrics) {
       metrics.timing('chunk.confirm.duration', totalDuration);
       metrics.increment('chunk.confirm.success', 1);
+      metrics.gauge('chunk.confirm.uploaded_count', uploadedCount);
     }
 
     return jsonResponse({
       success: true,
       uploaded: uploadedCount,
       total: totalChunks,
-      overallProgress: progress
+      overallProgress: progress.toFixed(2),
+      isNewChunk  // 告诉客户端是否是重复提交
     });
 
   } catch (error) {
