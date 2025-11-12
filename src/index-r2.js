@@ -25,6 +25,7 @@ import {
 import {
   handleUploadInit,
   handleUploadChunk,
+  handleUploadChunkConfirm,
   handleUploadComplete,
   handleUploadStatus,
   handleVerify,
@@ -45,7 +46,9 @@ const CONFIG = {
   MAX_CONCURRENT: 3, // 最大并发上传数 - 降低以避免带宽分散
   MAX_RETRY_ATTEMPTS: 5, // 最大重试次数
   RETRY_DELAY_BASE: 1000, // 基础重试延迟(ms)
-  REQUEST_TIMEOUT: 50000, // 单个请求超时时间(ms) - 50秒，留有余量
+  REQUEST_TIMEOUT: 180000, // 单个chunk上传超时(ms) - 180秒，适配生产环境慢速网络
+  INIT_TIMEOUT: 30000, // 初始化请求超时(ms) - 30秒
+  STATUS_TIMEOUT: 15000, // 状态查询超时(ms) - 15秒
 };
 
 
@@ -234,6 +237,13 @@ export default {
         if (path === '/api/upload/chunk' && request.method === 'POST') {
           const response = await handleUploadChunk(request, env, logger, metrics, CONFIG, retryWithBackoff, getAwsClient, getR2Url);
           tracker.finish(response.status, { handler: 'upload.chunk' });
+          ctx.waitUntil(metrics.flush(logger));
+          return response;
+        }
+
+        if (path === '/api/upload/chunk/confirm' && request.method === 'POST') {
+          const response = await handleUploadChunkConfirm(request, env, logger, metrics);
+          tracker.finish(response.status, { handler: 'upload.chunk.confirm' });
           ctx.waitUntil(metrics.flush(logger));
           return response;
         }

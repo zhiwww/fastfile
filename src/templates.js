@@ -557,7 +557,10 @@ export async function serveUploadPage(CONFIG) {
     const MAX_CONCURRENT = ${CONFIG.MAX_CONCURRENT};
     const MAX_RETRY_ATTEMPTS = ${CONFIG.MAX_RETRY_ATTEMPTS};
     const RETRY_DELAY_BASE = ${CONFIG.RETRY_DELAY_BASE};
-    const REQUEST_TIMEOUT = ${CONFIG.REQUEST_TIMEOUT};
+    // 超时配置：针对不同操作使用不同的超时时间
+    const REQUEST_TIMEOUT = ${CONFIG.REQUEST_TIMEOUT}; // chunk上传超时
+    const INIT_TIMEOUT = ${CONFIG.INIT_TIMEOUT}; // 初始化超时
+    const STATUS_TIMEOUT = ${CONFIG.STATUS_TIMEOUT}; // 状态查询超时
 
     /**
      * 判断错误是否可重试
@@ -997,7 +1000,7 @@ export async function serveUploadPage(CONFIG) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ files: filesInfo, password })
-      });
+      }, INIT_TIMEOUT); // 使用较短的初始化超时
 
       if (!initResponse.ok) {
         throw new Error('初始化失败');
@@ -1025,6 +1028,7 @@ export async function serveUploadPage(CONFIG) {
         const file = files[i];
         const fileUpload = fileUploads[i];
         const totalChunks = fileUpload.totalChunks;
+        const parts = fileUpload.parts; // 🔧 获取预签名URL列表
 
         // 🔧 修复：不再预先切片所有chunks，而是在上传时即时切片
         // 原因：预先切片会创建多个Blob引用，可能导致内存问题或文件句柄问题
@@ -1053,19 +1057,21 @@ export async function serveUploadPage(CONFIG) {
               const chunk = file.slice(start, end);
               const chunkSize = end - start;
 
-              const formData = new FormData();
-              formData.append('uploadId', uploadId);
-              formData.append('fileName', file.name);
-              formData.append('chunkIndex', chunkIndex);
-              formData.append('chunk', chunk);
+              // 🔧 新方案：使用预签名URL直接上传到R2
+              const partInfo = parts[chunkIndex];
+              const partNumber = partInfo.partNumber;
+              const uploadUrl = partInfo.uploadUrl;
+              const signedHeaders = partInfo.headers; // 🔧 获取签名headers
 
               // 使用重试机制上传分块
               const chunkStartTime = Date.now();
               const chunkData = await retryWithBackoff(
                 async () => {
-                  const chunkResponse = await fetchWithTimeout('/api/upload/chunk', {
-                    method: 'POST',
-                    body: formData
+                  // 🔧 直接PUT到R2（使用签名headers）
+                  const chunkResponse = await fetchWithTimeout(uploadUrl, {
+                    method: 'PUT',
+                    body: chunk,
+                    headers: signedHeaders  // 🔧 使用后端返回的签名headers
                   });
 
                   if (!chunkResponse.ok) {
@@ -1074,14 +1080,39 @@ export async function serveUploadPage(CONFIG) {
                     throw error;
                   }
 
-                  const data = await chunkResponse.json();
-                  if (!data.success) {
-                    const error = new Error(data.error || '分块上传失败');
-                    error.response = chunkResponse;
+                  // 获取ETag
+                  const etag = chunkResponse.headers.get('etag');
+                  if (!etag) {
+                    throw new Error('No ETag returned from R2');
+                  }
+
+                  // 🔧 调用Worker确认上传（轻量级操作）
+                  const confirmResponse = await fetchWithTimeout('/api/upload/chunk/confirm', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      uploadId,
+                      fileName: file.name,
+                      chunkIndex,
+                      partNumber,
+                      etag
+                    })
+                  }, 10000); // 10秒超时
+
+                  if (!confirmResponse.ok) {
+                    const error = new Error(\`确认上传失败: \${file.name} - chunk \${chunkIndex}\`);
+                    error.response = confirmResponse;
                     throw error;
                   }
 
-                  return data;
+                  const confirmData = await confirmResponse.json();
+                  if (!confirmData.success) {
+                    const error = new Error(confirmData.error || '确认上传失败');
+                    error.response = confirmResponse;
+                    throw error;
+                  }
+
+                  return confirmData;
                 },
                 MAX_RETRY_ATTEMPTS,
                 \`Upload chunk \${chunkIndex + 1} of \${file.name}\`
@@ -1134,7 +1165,7 @@ export async function serveUploadPage(CONFIG) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ uploadId })
-      });
+      }, INIT_TIMEOUT); // 使用较短的初始化超时
 
       if (!completeResponse.ok) {
         throw new Error('完成上传失败');

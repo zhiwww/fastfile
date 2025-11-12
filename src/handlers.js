@@ -56,10 +56,11 @@ export async function handleUploadInit(request, env, logger, metrics, CONFIG, re
     const awsClient = getAwsClient(env);
     const r2Url = getR2Url(env);
 
-    // 为每个文件创建multipart upload
+    // 为每个文件创建multipart upload并生成预签名 URL
     const fileUploads = [];
     for (const file of files) {
       const tempKey = `temp/${uploadId}/${file.name}`;
+      const fileStartTime = Date.now();
 
       // 使用重试机制创建multipart upload
       const xmlResult = await retryWithBackoff(
@@ -83,13 +84,54 @@ export async function handleUploadInit(request, env, logger, metrics, CONFIG, re
 
       const totalChunks = Math.ceil(file.size / CONFIG.CHUNK_SIZE);
 
+      // 🔧 新增：为每个 part 生成预签名 URL
+      const parts = [];
+      const presignStartTime = Date.now();
+
+      for (let partNumber = 1; partNumber <= totalChunks; partNumber++) {
+        // 生成签名请求信息
+        const uploadUrl = `${r2Url}/${tempKey}?partNumber=${partNumber}&uploadId=${encodeURIComponent(xmlResult.UploadId)}`;
+
+        const signedRequest = await awsClient.sign(uploadUrl, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/octet-stream'
+          }
+        });
+
+        // 提取签名headers（包含AWS签名认证信息）
+        const signedHeaders = {};
+        signedRequest.headers.forEach((value, key) => {
+          signedHeaders[key] = value;
+        });
+
+        parts.push({
+          partNumber,
+          uploadUrl: signedRequest.url,  // R2 endpoint URL
+          headers: signedHeaders          // 🔧 新增：签名headers
+        });
+      }
+
+      const presignDuration = Date.now() - presignStartTime;
+      requestLogger.info('Generated presigned URLs', {
+        fileName: file.name,
+        totalChunks,
+        presignDuration: `${presignDuration}ms`
+      });
+
       fileUploads.push({
         name: file.name,
         size: file.size,
         key: tempKey,
         uploadId: xmlResult.UploadId,
-        totalChunks
-        // 注意：不再使用 uploadedChunks 数组，改为独立的 KV 记录
+        totalChunks,
+        parts  // 🔧 新增：返回预签名 URL 列表
+      });
+
+      const fileInitDuration = Date.now() - fileStartTime;
+      requestLogger.info('File init completed', {
+        fileName: file.name,
+        totalDuration: `${fileInitDuration}ms`
       });
     }
 
@@ -106,13 +148,20 @@ export async function handleUploadInit(request, env, logger, metrics, CONFIG, re
 
     await env.FILE_META.put(`upload:${uploadId}`, JSON.stringify(uploadMeta));
 
+    requestLogger.info('Upload init completed', {
+      uploadId,
+      filesCount: files.length,
+      totalChunks: fileUploads.reduce((sum, f) => sum + f.totalChunks, 0)
+    });
+
     return jsonResponse({
       success: true,
       uploadId,
       files: fileUploads.map(f => ({
         name: f.name,
         totalChunks: f.totalChunks,
-        uploadId: f.uploadId
+        uploadId: f.uploadId,
+        parts: f.parts  // 🔧 新增：返回预签名 URL
       })),
       isSingleZip,
       chunkSize: CONFIG.CHUNK_SIZE
@@ -227,6 +276,104 @@ export async function handleUploadChunk(request, env, logger, metrics, CONFIG, r
   } catch (error) {
     console.error('Chunk upload error:', error);
     return errorResponse('分块上传失败: ' + error.message, 500);
+  }
+}
+
+/**
+ * 🔧 新增：确认 chunk 上传（前端直接上传到 R2 后调用）
+ * 此端点非常轻量级，不处理文件数据，只记录 ETag
+ */
+export async function handleUploadChunkConfirm(request, env, logger, metrics) {
+  const requestLogger = logger ? logger.child({ handler: 'upload.chunk.confirm' }) : { info: () => {}, warn: () => {}, error: () => {} };
+  const t0 = Date.now();
+
+  try {
+    const { uploadId, fileName, chunkIndex, partNumber, etag } = await request.json();
+
+    const t1 = Date.now();
+    console.log(`⏱️ [ChunkConfirm] Parse request: ${t1 - t0}ms`);
+
+    // 验证参数
+    if (!uploadId || !fileName || chunkIndex === undefined || !partNumber || !etag) {
+      requestLogger.warn('Missing required parameters', { uploadId, fileName, chunkIndex, partNumber, etag });
+      return errorResponse('缺少必要参数', 400);
+    }
+
+    // 获取上传元数据
+    const metaStr = await env.FILE_META.get(`upload:${uploadId}`);
+    if (!metaStr) {
+      return errorResponse('上传不存在', 404);
+    }
+
+    const t2 = Date.now();
+    console.log(`⏱️ [ChunkConfirm] Get upload meta: ${t2 - t1}ms`);
+
+    const meta = JSON.parse(metaStr);
+    const fileUpload = meta.files.find(f => f.name === fileName);
+
+    if (!fileUpload) {
+      return errorResponse('文件不存在', 404);
+    }
+
+    // 🔧 保存 chunk 记录到 KV（与原 handleUploadChunk 相同的格式）
+    const chunkKey = `upload:${uploadId}:chunk:${fileName}:${chunkIndex}`;
+    await env.FILE_META.put(chunkKey, JSON.stringify({
+      partNumber,
+      etag,
+      fileName,
+      chunkIndex,
+      uploadedAt: Date.now()
+    }));
+
+    const t3 = Date.now();
+    console.log(`⏱️ [ChunkConfirm] Save chunk meta: ${t3 - t2}ms`);
+
+    requestLogger.info('Chunk confirmed', {
+      uploadId,
+      fileName,
+      chunkIndex,
+      partNumber,
+      etag: etag.substring(0, 10) + '...'
+    });
+
+    // 计算总体进度（从独立的 chunk 记录中统计）
+    const totalChunks = meta.files.reduce((sum, f) => sum + f.totalChunks, 0);
+    let uploadedCount = 0;
+
+    // 统计已上传的 chunks
+    for (const file of meta.files) {
+      for (let i = 0; i < file.totalChunks; i++) {
+        const key = `upload:${uploadId}:chunk:${file.name}:${i}`;
+        const exists = await env.FILE_META.get(key);
+        if (exists) uploadedCount++;
+      }
+    }
+
+    const t4 = Date.now();
+    console.log(`⏱️ [ChunkConfirm] Count progress: ${t4 - t3}ms`);
+
+    const progress = (uploadedCount / totalChunks) * 100;
+
+    const totalDuration = Date.now() - t0;
+    console.log(`⏱️ [ChunkConfirm] Total duration: ${totalDuration}ms (target: <1000ms)`);
+
+    if (metrics) {
+      metrics.timing('chunk.confirm.duration', totalDuration);
+      metrics.increment('chunk.confirm.success', 1);
+    }
+
+    return jsonResponse({
+      success: true,
+      uploaded: uploadedCount,
+      total: totalChunks,
+      overallProgress: progress
+    });
+
+  } catch (error) {
+    console.error('❌ [ChunkConfirm] Error:', error);
+    if (logger) logger.error('Chunk confirm failed', { error: error.message });
+    if (metrics) metrics.increment('chunk.confirm.error', 1);
+    return errorResponse('确认上传失败: ' + error.message, 500);
   }
 }
 
