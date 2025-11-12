@@ -42,7 +42,7 @@ import {
 // 统一配置 - 前后端共享
 // =============================================
 const CONFIG = {
-  CHUNK_SIZE: 5 * 1024 * 1024, // 5MB - R2 Multipart 要求（除最后一个part外必须≥5MB）
+  CHUNK_SIZE: 50 * 1024 * 1024, // 5MB - R2 Multipart 要求（除最后一个part外必须≥5MB）
   MAX_CONCURRENT: 3, // 最大并发上传数 - 降低以避免带宽分散
   MAX_RETRY_ATTEMPTS: 5, // 最大重试次数
   RETRY_DELAY_BASE: 1000, // 基础重试延迟(ms)
